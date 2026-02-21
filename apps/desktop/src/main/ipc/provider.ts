@@ -1,7 +1,8 @@
 import { ipcMain } from 'electron';
 import { createProvider, getProviderById, listModelProfilesByProvider, listProviders, replaceProviderModelProfiles } from '../services/db';
-import { getSecret, setSecret } from '../services/keychain';
+import { getSecret, removeSecret, setSecret } from '../services/keychain';
 import { getCodexDeviceAuthState, getCodexLoginStatus, listCodexAvailableModels, startCodexDeviceAuth } from '../services/providers/codex';
+import { listOllamaModels, testOllamaConnection } from '../services/providers/ollama';
 import { listOpenAIModels, testOpenAIConnection } from '../services/providers/openai';
 import {
   providerCreateSchema,
@@ -57,16 +58,21 @@ const syncModelsForProvider = async (
   },
   secret?: string
 ) => {
-  if (provider.type !== 'openai') {
-    return [] as ReturnType<typeof mapModelProfile>[];
+  if (provider.type === 'openai') {
+    const modelIds =
+      provider.auth_kind === 'oauth_subscription'
+        ? await listCodexAvailableModels()
+        : await listOpenAIModels(secret ?? '');
+
+    return replaceProviderModelProfiles(provider.id, modelIds).map(mapModelProfile);
   }
 
-  const modelIds =
-    provider.auth_kind === 'oauth_subscription'
-      ? await listCodexAvailableModels()
-      : await listOpenAIModels(secret ?? '');
+  if (provider.type === 'local') {
+    const modelIds = await listOllamaModels(secret);
+    return replaceProviderModelProfiles(provider.id, modelIds).map(mapModelProfile);
+  }
 
-  return replaceProviderModelProfiles(provider.id, modelIds).map(mapModelProfile);
+  return [] as ReturnType<typeof mapModelProfile>[];
 };
 
 export const registerProviderHandlers = (): void => {
@@ -87,7 +93,13 @@ export const registerProviderHandlers = (): void => {
       throw new Error('Provider not found or invalid keychain reference');
     }
 
-    await setSecret(provider.keychain_ref, parsed.secret);
+    const secret = parsed.secret.trim();
+    if (secret) {
+      await setSecret(provider.keychain_ref, secret);
+    } else {
+      await removeSecret(provider.keychain_ref);
+    }
+
     return { ok: true };
   });
 
@@ -121,18 +133,30 @@ export const registerProviderHandlers = (): void => {
       };
     }
 
-    const secret = await getSecret(provider.keychain_ref);
-    if (!secret) {
-      return { ok: false, reason: 'No secret saved for provider' };
-    }
-
     if (provider.type === 'openai') {
+      const secret = await getSecret(provider.keychain_ref);
+      if (!secret) {
+        return { ok: false, reason: 'No secret saved for provider' };
+      }
+
       const result = await testOpenAIConnection(secret);
       const models = result.ok ? await syncModelsForProvider(provider, secret) : [];
       return {
         ok: result.ok,
         status: result.status,
         reason: result.ok ? undefined : 'OpenAI connectivity test failed',
+        models
+      };
+    }
+
+    if (provider.type === 'local') {
+      const endpoint = await getSecret(provider.keychain_ref);
+      const result = await testOllamaConnection(endpoint ?? undefined);
+      const models = result.ok ? await syncModelsForProvider(provider, endpoint ?? undefined) : [];
+      return {
+        ok: result.ok,
+        status: result.status,
+        reason: result.reason,
         models
       };
     }
@@ -179,10 +203,10 @@ export const registerProviderHandlers = (): void => {
     }
 
     const secret = await getSecret(provider.keychain_ref);
-    if (!secret) {
+    if (provider.type === 'openai' && !secret) {
       throw new Error('No API key saved for this provider.');
     }
 
-    return syncModelsForProvider(provider, secret);
+    return syncModelsForProvider(provider, secret ?? undefined);
   });
 };

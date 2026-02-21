@@ -19,6 +19,7 @@ type ProviderSettingsProps = {
 
 const CHATGPT_SUBSCRIPTION_URL = 'https://chatgpt.com';
 const OPENAI_API_BILLING_URL = 'https://platform.openai.com/settings/organization/billing/overview';
+const DEFAULT_OLLAMA_ENDPOINT = 'http://127.0.0.1:11434';
 
 const formatSuccessMessage = (models?: ModelProfile[]): string => {
   const count = models?.length ?? 0;
@@ -36,8 +37,10 @@ export const ProviderSettings = ({
 }: ProviderSettingsProps) => {
   const [activeProviderId, setActiveProviderId] = useState<string>(providers[0]?.id ?? '');
   const [apiKey, setApiKey] = useState('');
+  const [localEndpoint, setLocalEndpoint] = useState('');
   const [status, setStatus] = useState<string | null>(null);
   const [newProviderName, setNewProviderName] = useState('OpenAI Primary');
+  const [newProviderType, setNewProviderType] = useState<Provider['type']>('openai');
   const [newAuthKind, setNewAuthKind] = useState<Provider['authKind']>('api_key');
   const [subscriptionState, setSubscriptionState] = useState<ProviderSubscriptionLoginState | null>(null);
 
@@ -53,6 +56,22 @@ export const ProviderSettings = ({
     }
   }, [activeProviderId, providers]);
 
+  useEffect(() => {
+    if (newProviderType === 'local') {
+      if (newAuthKind !== 'api_key') {
+        setNewAuthKind('api_key');
+      }
+      if (newProviderName === 'OpenAI Primary') {
+        setNewProviderName('Local Ollama');
+      }
+      return;
+    }
+
+    if (newProviderType === 'openai' && newProviderName === 'Local Ollama') {
+      setNewProviderName('OpenAI Primary');
+    }
+  }, [newAuthKind, newProviderName, newProviderType]);
+
   const activeProvider = useMemo(
     () => providers.find((provider) => provider.id === activeProviderId) ?? null,
     [activeProviderId, providers]
@@ -60,7 +79,11 @@ export const ProviderSettings = ({
 
   const onCreate = async () => {
     if (!newProviderName.trim()) return;
-    await onCreateProvider({ type: 'openai', displayName: newProviderName.trim(), authKind: newAuthKind });
+    await onCreateProvider({
+      type: newProviderType,
+      displayName: newProviderName.trim(),
+      authKind: newProviderType === 'local' ? 'api_key' : newAuthKind
+    });
     setStatus(`Created "${newProviderName.trim()}"`);
   };
 
@@ -69,6 +92,19 @@ export const ProviderSettings = ({
     if (!activeProviderId || !apiKey.trim()) return;
 
     await onSaveSecret(activeProviderId, apiKey.trim());
+    const result = await onTestProvider(activeProviderId);
+    setStatus(result.ok
+      ? formatSuccessMessage(result.models)
+      : `Failed (${result.status ?? 'n/a'})${result.reason ? `: ${result.reason}` : ''}`
+    );
+  };
+
+  const onSubmitLocalEndpoint = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!activeProviderId) return;
+
+    await onSaveSecret(activeProviderId, localEndpoint.trim());
+
     const result = await onTestProvider(activeProviderId);
     setStatus(result.ok
       ? formatSuccessMessage(result.models)
@@ -121,13 +157,20 @@ export const ProviderSettings = ({
       <CardContent className="grid gap-4">
         <div className="grid gap-2">
           <Label className="text-xs">New provider</Label>
-          <div className="grid gap-2 sm:grid-cols-[1fr_160px_auto]">
+          <div className="grid gap-2 sm:grid-cols-[1fr_140px_160px_auto]">
             <Input value={newProviderName} onChange={(e) => setNewProviderName(e.target.value)} placeholder="Label" />
+            <Select value={newProviderType} onValueChange={(v) => setNewProviderType(v as Provider['type'])}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="openai">OpenAI</SelectItem>
+                <SelectItem value="local">Local (Ollama)</SelectItem>
+              </SelectContent>
+            </Select>
             <Select value={newAuthKind} onValueChange={(v) => setNewAuthKind(v as Provider['authKind'])}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="api_key">API Key</SelectItem>
-                <SelectItem value="oauth_subscription">Subscription</SelectItem>
+                {newProviderType !== 'local' && <SelectItem value="oauth_subscription">Subscription</SelectItem>}
               </SelectContent>
             </Select>
             <Button variant="outline" type="button" onClick={() => void onCreate()}>Add</Button>
@@ -145,14 +188,33 @@ export const ProviderSettings = ({
               {providers.length === 0 && <SelectItem value="__none__">No providers</SelectItem>}
               {providers.map((p) => (
                 <SelectItem key={p.id} value={p.id}>
-                  {p.displayName} [{p.authKind === 'api_key' ? 'Key' : 'Sub'}]
+                  {p.displayName} [{p.type === 'local' ? 'Local' : p.authKind === 'api_key' ? 'Key' : 'Sub'}]
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
         </div>
 
-        {activeProvider?.authKind === 'api_key' ? (
+        {activeProvider?.type === 'local' ? (
+          <form onSubmit={onSubmitLocalEndpoint} className="grid gap-2">
+            <Label className="text-xs">Ollama endpoint (optional)</Label>
+            <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+              <Input
+                autoComplete="off"
+                value={localEndpoint}
+                onChange={(e) => setLocalEndpoint(e.target.value)}
+                placeholder={DEFAULT_OLLAMA_ENDPOINT}
+              />
+              <Button type="submit">{localEndpoint.trim() ? 'Save + Test' : 'Test Default'}</Button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" variant="outline" type="button" onClick={() => void onCheckSupport()}>Refresh Models</Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Leave blank to use {DEFAULT_OLLAMA_ENDPOINT}.
+            </p>
+          </form>
+        ) : activeProvider?.authKind === 'api_key' ? (
           <form onSubmit={onSubmitApiKey} className="grid gap-2">
             <Label className="text-xs">API key</Label>
             <div className="grid gap-2 sm:grid-cols-[1fr_auto]">

@@ -7,7 +7,7 @@ OpenVibez gives you a native chat interface that connects to the AI providers yo
 ![Chat View](docs/screenshots/chat-empty.png)
 ![Settings](docs/screenshots/settings.png)
 
-> **Status:** Early alpha. Core chat loop works with OpenAI API keys and ChatGPT subscriptions. Multi-provider support, local models, and agent tooling are in progress.
+> **Status:** Early alpha. Core chat loop works with OpenAI API keys, ChatGPT subscriptions, and local Ollama models. Multi-provider expansion and agent tooling are in progress.
 
 ---
 
@@ -69,10 +69,11 @@ npm run db:studio
 ### Connect a provider
 
 1. Launch the app and go to **Settings**
-2. Add a provider (API Key or ChatGPT Subscription)
-3. For API key: paste your OpenAI key, hit **Save + Test**
+2. Add a provider (OpenAI API Key, ChatGPT Subscription, or Local/Ollama)
+3. For OpenAI API key: paste your key, hit **Save + Test**
 4. For subscription: click **Connect ChatGPT** and complete the device login flow
-5. Models sync automatically on successful connection
+5. For Ollama: select **Local (Ollama)** and use **Test Default** (or save a custom endpoint URL)
+6. Models sync automatically on successful connection
 
 ### Environment variables
 
@@ -89,6 +90,7 @@ npm run db:studio
 - [x] Provider management — create, configure, test connections
 - [x] API key auth with OS keychain storage (keytar)
 - [x] ChatGPT subscription auth via Codex CLI device login
+- [x] Local model support via Ollama (default `http://127.0.0.1:11434`)
 - [x] Model discovery — auto-sync available models from provider
 - [x] Session management — create, switch, persist conversations
 - [x] Streaming chat with real-time text deltas
@@ -110,7 +112,7 @@ The type system already supports `openai | anthropic | local` provider types. Ne
 - **Anthropic / Claude** — Direct API integration with Claude 4 family models. Same key-in-keychain pattern as OpenAI.
 - **Google Gemini** — API key auth, model sync, streaming completions.
 - **OpenRouter** — Single key, access to 100+ models from every major provider.
-- **Local / Ollama** — Connect to a local Ollama instance. Zero-config for `localhost:11434`, auto-discover installed models, fully offline capable.
+- **Advanced Local / Ollama** — richer local runtime controls (per-provider endpoint presets, model options, and diagnostics).
 - **Custom OpenAI-compatible** — Any endpoint that speaks the OpenAI chat completions API (LM Studio, vLLM, text-generation-webui, etc.)
 
 ### Agent Capabilities

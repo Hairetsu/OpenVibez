@@ -10,7 +10,7 @@ export const providerCreateSchema = z.object({
 
 export const providerSecretSchema = z.object({
   providerId: z.string().min(1),
-  secret: z.string().min(1)
+  secret: z.string()
 });
 
 export const providerIdSchema = z.object({

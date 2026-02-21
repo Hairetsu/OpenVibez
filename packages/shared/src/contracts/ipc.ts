@@ -8,6 +8,11 @@ export const createProviderSchema = z.object({
   authKind: z.enum(['api_key', 'oauth_subscription'])
 });
 
+export const saveProviderSecretSchema = z.object({
+  providerId: z.string().min(1),
+  secret: z.string()
+});
+
 export const createSessionSchema = z.object({
   title: z.string().min(1),
   providerId: z.string().min(1),

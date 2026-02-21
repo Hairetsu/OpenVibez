@@ -55,7 +55,7 @@ export const MessageList = ({ messages, liveText, streaming }: MessageListProps)
             </div>
           ))}
 
-          {liveText && (
+          {liveText && streaming && (
             <div className="group">
               <div className="mb-1 flex items-center gap-2">
                 <span className="text-[11px] font-medium uppercase tracking-wide text-primary/70">
