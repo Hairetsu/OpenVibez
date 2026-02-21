@@ -79,6 +79,7 @@ export const App = () => {
               onCreateSession={onCreateSession}
               messages={store.messages}
               onSend={store.sendMessage}
+              onCancel={store.cancelMessage}
               modelId={store.selectedModelId}
               modelOptions={store.modelProfiles}
               onModelChange={store.setSelectedModelId}

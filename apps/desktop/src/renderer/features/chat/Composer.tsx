@@ -2,11 +2,12 @@ import { KeyboardEvent, useCallback, useRef, useState } from 'react';
 
 type ComposerProps = {
   onSend: (content: string) => Promise<void>;
+  onCancel: () => Promise<void>;
+  streaming: boolean;
 };
 
-export const Composer = ({ onSend }: ComposerProps) => {
+export const Composer = ({ onSend, onCancel, streaming }: ComposerProps) => {
   const [value, setValue] = useState('');
-  const [sending, setSending] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const resize = useCallback(() => {
@@ -18,26 +19,32 @@ export const Composer = ({ onSend }: ComposerProps) => {
 
   const send = async () => {
     const trimmed = value.trim();
-    if (!trimmed || sending) return;
+    if (!trimmed) return;
 
-    setSending(true);
     setValue('');
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
     }
 
-    try {
-      await onSend(trimmed);
-    } finally {
-      setSending(false);
+    void onSend(trimmed).finally(() => {
       textareaRef.current?.focus();
-    }
+    });
+  };
+
+  const cancel = async () => {
+    if (!streaming) return;
+    await onCancel();
+    textareaRef.current?.focus();
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      void send();
+      if (value.trim()) {
+        void send();
+      } else if (streaming) {
+        void cancel();
+      }
     }
   };
 
@@ -59,17 +66,23 @@ export const Composer = ({ onSend }: ComposerProps) => {
           />
           <button
             type="button"
-            onClick={() => void send()}
-            disabled={sending || !value.trim()}
+            onClick={() => void (value.trim() ? send() : cancel())}
+            disabled={!streaming && !value.trim()}
             className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-30"
           >
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-              <path d="M7 12V2M7 2l-4 4M7 2l4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-            </svg>
+            {!value.trim() && streaming ? (
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                <rect x="3" y="3" width="8" height="8" rx="1.2" fill="currentColor" />
+              </svg>
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                <path d="M7 12V2M7 2l-4 4M7 2l4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            )}
           </button>
         </div>
         <p className="mt-1.5 text-center text-[10px] text-muted-foreground/50">
-          {'\u2318'}+Enter to send
+          {streaming ? `${'\u2318'}+Enter to cancel` : `${'\u2318'}+Enter to send`}
         </p>
       </div>
     </div>

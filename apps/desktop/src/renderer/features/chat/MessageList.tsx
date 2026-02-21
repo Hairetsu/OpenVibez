@@ -1,14 +1,15 @@
 import { useEffect, useRef } from 'react';
-import type { Message } from '../../../preload/types';
+import type { Message, MessageStreamTrace } from '../../../preload/types';
 import { cn } from '@/lib/utils';
 
 type MessageListProps = {
   messages: Message[];
   liveText?: string;
   streaming?: boolean;
+  traces?: MessageStreamTrace[];
 };
 
-export const MessageList = ({ messages, liveText, streaming }: MessageListProps) => {
+export const MessageList = ({ messages, liveText, streaming, traces = [] }: MessageListProps) => {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -51,6 +52,22 @@ export const MessageList = ({ messages, liveText, streaming }: MessageListProps)
                 )}
               >
                 <p className="whitespace-pre-wrap">{message.content}</p>
+              </div>
+            </div>
+          ))}
+
+          {traces.map((trace, index) => (
+            <div key={`${trace.traceKind}-${index}`} className="group">
+              <div className="mb-1 flex items-center gap-2">
+                <span className="text-[11px] font-medium uppercase tracking-wide text-accent-foreground/70">
+                  {trace.traceKind}
+                </span>
+                {streaming && (
+                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent-foreground/40" />
+                )}
+              </div>
+              <div className="rounded-lg border border-border/50 bg-muted/20 px-3 py-2.5 text-[12px] leading-relaxed text-foreground/85">
+                <p className="whitespace-pre-wrap">{trace.text}</p>
               </div>
             </div>
           ))}

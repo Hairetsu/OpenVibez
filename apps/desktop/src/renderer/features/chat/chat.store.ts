@@ -40,6 +40,7 @@ type ChatState = {
   createSession: (title: string) => Promise<void>;
   selectSession: (sessionId: string) => Promise<void>;
   sendMessage: (content: string) => Promise<void>;
+  cancelMessage: () => Promise<void>;
   saveProviderSecret: (providerId: string, secret: string) => Promise<{ ok: boolean }>;
   testProvider: (providerId: string) => Promise<{ ok: boolean; status?: number; reason?: string; models?: ModelProfile[] }>;
   addWorkspace: (path: string) => Promise<void>;
@@ -52,6 +53,7 @@ type ChatState = {
 };
 
 const DEFAULT_MODEL_ID = 'gpt-4o-mini';
+const CANCEL_WAIT_TIMEOUT_MS = 4000;
 
 let streamUnsubscribe: (() => void) | null = null;
 
@@ -159,6 +161,8 @@ const ensureStreamListener = (
     }
   });
 };
+
+const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 export const useChatStore = create<ChatState>((set, get) => ({
   ready: false,
@@ -273,6 +277,30 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   sendMessage: async (content: string) => {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    const runningStreamId = get().streaming.active ? get().streaming.streamId : null;
+    if (runningStreamId) {
+      await get().cancelMessage();
+
+      const started = Date.now();
+      while (true) {
+        const { streaming } = get();
+        const settled = !streaming.active || streaming.streamId !== runningStreamId;
+        if (settled) {
+          break;
+        }
+
+        if (Date.now() - started >= CANCEL_WAIT_TIMEOUT_MS) {
+          break;
+        }
+        await wait(40);
+      }
+    }
+
     const sessionId = get().selectedSessionId;
     if (!sessionId) {
       await get().createSession('New Vibe Session');
@@ -296,7 +324,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     const sent = await api.message.send({
       sessionId: activeSessionId,
-      content,
+      content: trimmed,
       streamId,
       modelId: get().selectedModelId,
       accessMode: get().accessMode,
@@ -305,15 +333,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     set((state) => ({
       messages: [...state.messages, sent.userMessage, sent.assistantMessage],
-      streaming: {
-        ...state.streaming,
-        active: false,
-        status: state.streaming.status ?? 'Done'
-      }
+      streaming:
+        state.streaming.streamId === streamId
+          ? {
+              ...state.streaming,
+              active: false,
+              status: state.streaming.status ?? 'Done'
+            }
+          : state.streaming
     }));
 
     const usageSummary = await api.usage.summary({ days: 30 });
     set({ usageSummary });
+  },
+
+  cancelMessage: async () => {
+    const streamId = get().streaming.streamId;
+    if (!streamId) {
+      return;
+    }
+
+    set((state) => ({
+      streaming: {
+        ...state.streaming,
+        status: 'Cancelling...'
+      }
+    }));
+
+    await api.message.cancel({ streamId });
   },
 
   saveProviderSecret: async (providerId, secret) => {

@@ -19,6 +19,7 @@ const api: OpenVibezApi = {
   },
   message: {
     send: (input) => ipcRenderer.invoke('message:send', input),
+    cancel: (input) => ipcRenderer.invoke('message:cancel', input),
     list: (input) => ipcRenderer.invoke('message:list', input),
     onStreamEvent: (handler) => {
       const listener = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof handler>[0]) => {

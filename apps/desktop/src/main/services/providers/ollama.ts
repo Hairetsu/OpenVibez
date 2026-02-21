@@ -10,6 +10,7 @@ type OllamaCompletionInput = {
   temperature?: number;
   maxOutputTokens?: number;
   stream?: boolean;
+  signal?: AbortSignal;
   onEvent?: (event: { type: 'status' | 'assistant_delta'; text?: string; delta?: string }) => void;
 };
 
@@ -168,6 +169,7 @@ export const createOllamaCompletion = async (input: OllamaCompletionInput): Prom
       headers: {
         'Content-Type': 'application/json'
       },
+      signal: input.signal,
       body: JSON.stringify(body)
     });
   } catch (error) {

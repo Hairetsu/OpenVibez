@@ -9,6 +9,7 @@ type OpenAICompletionInput = {
   history: HistoryMessage[];
   temperature?: number;
   maxOutputTokens?: number;
+  signal?: AbortSignal;
   onEvent?: (event: { type: 'status' | 'assistant_delta'; text?: string; delta?: string }) => void;
 };
 
@@ -122,6 +123,7 @@ export const createOpenAICompletion = async (input: OpenAICompletionInput): Prom
       'Content-Type': 'application/json',
       Authorization: `Bearer ${input.apiKey}`
     },
+    signal: input.signal,
     body: JSON.stringify(createRequestBody(input))
   });
 
@@ -230,6 +232,7 @@ export const createOpenAICompletion = async (input: OpenAICompletionInput): Prom
         'Content-Type': 'application/json',
         Authorization: `Bearer ${input.apiKey}`
       },
+      signal: input.signal,
       body: JSON.stringify({ ...createRequestBody(input), stream: false })
     });
 

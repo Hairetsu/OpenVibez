@@ -20,7 +20,7 @@ import { createCodexCompletion, getCodexLoginStatus } from '../services/provider
 import { createOllamaCompletion } from '../services/providers/ollama';
 import { createOpenAICompletion } from '../services/providers/openai';
 import { logger } from '../util/logger';
-import { messageListSchema, messageSendSchema, sessionArchiveSchema, sessionCreateSchema } from './contracts';
+import { messageCancelSchema, messageListSchema, messageSendSchema, sessionArchiveSchema, sessionCreateSchema } from './contracts';
 
 const mapSession = (row: {
   id: string;
@@ -76,9 +76,44 @@ const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
 const DEFAULT_OLLAMA_MODEL = 'llama3.2:latest';
 const HISTORY_WINDOW = 30;
 const LOCAL_TOOL_CALL_PREFIX = 'TOOL_CALL';
-const MAX_LOCAL_TOOL_STEPS = 12;
+const LOCAL_PLAN_PREFIX = 'PLAN';
+const LOCAL_STEP_DONE_PREFIX = 'STEP_DONE';
+const LOCAL_FINAL_PREFIX = 'FINAL';
+const MAX_LOCAL_TOOL_STEPS = 24;
 const SHELL_COMMAND_TIMEOUT_MS = 120_000;
 const SHELL_OUTPUT_LIMIT = 20_000;
+const MAX_LOCAL_PLAN_STEPS = 12;
+
+class RequestCancelledError extends Error {
+  constructor(message = 'Request cancelled by user.') {
+    super(message);
+    this.name = 'AbortError';
+  }
+}
+
+type InflightRequest = {
+  streamId: string;
+  controller: AbortController;
+  cancel: () => void;
+};
+
+const inflightRequests = new Map<string, InflightRequest>();
+
+const isCancellationError = (error: unknown): boolean => {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+
+  const err = error as { name?: unknown; message?: unknown };
+  const message = typeof err.message === 'string' ? err.message : '';
+  return err.name === 'AbortError' || /cancelled|canceled|aborted/i.test(message);
+};
+
+const throwIfAborted = (signal: AbortSignal): void => {
+  if (signal.aborted) {
+    throw new RequestCancelledError();
+  }
+};
 
 const asMessage = (error: unknown): string => {
   if (error instanceof Error && error.message.trim()) {
@@ -151,6 +186,19 @@ type LocalToolCall = {
   };
 };
 
+type LocalExecutionPlan = {
+  steps: string[];
+};
+
+type LocalStepDone = {
+  index: number;
+  note?: string;
+};
+
+type LocalFinal = {
+  message: string;
+};
+
 const buildLocalToolSystemPrompt = (input: {
   accessMode: 'scoped' | 'root';
   workspacePath?: string;
@@ -162,6 +210,11 @@ const buildLocalToolSystemPrompt = (input: {
   return [
     'You are OpenVibez local coding assistant with autonomous CLI tool access.',
     '',
+    'You MUST follow this protocol:',
+    `1) First response: ${LOCAL_PLAN_PREFIX} {"steps":["step 1","step 2",...]}`,
+    `2) During execution: respond with either ${LOCAL_TOOL_CALL_PREFIX} {...} or ${LOCAL_STEP_DONE_PREFIX} {"index":<1-based>,"note":"optional"}`,
+    `3) Only when every step is completed: ${LOCAL_FINAL_PREFIX} {"message":"final user response"}`,
+    '',
     `When you need to execute a shell command, respond with exactly one line:`,
     `${LOCAL_TOOL_CALL_PREFIX} {"name":"run_shell","arguments":{"command":"<shell command>","cwd":"<optional cwd>"}}`,
     'No markdown, no extra text when calling a tool.',
@@ -170,47 +223,80 @@ const buildLocalToolSystemPrompt = (input: {
     '- run_shell(command: string, cwd?: string): run a shell command and return stdout/stderr/exit code.',
     '',
     'Use tools whenever they help fulfill the request. You may call tools repeatedly until done.',
+    'Do not stop early. If the user asks to build/create/clone a project, produce actual project files, not only a directory or README.',
+    'Before finalizing, verify key outputs exist by running shell checks (for example ls/find/test commands).',
+    `Only return ${LOCAL_FINAL_PREFIX} after all planned steps are complete.`,
     `Access mode: ${input.accessMode}.`,
     context,
-    'After tool results are returned, either call another tool or provide the final answer to the user.'
+    'After tool results are returned, either call another tool, mark a step complete, or finalize if everything is done.'
   ].join('\n');
 };
 
-const parseLocalToolCall = (text: string): LocalToolCall | null => {
+const parsePrefixedJson = (text: string, prefix: string): unknown | null => {
   const trimmed = text.trim();
-  const prefixIndex = trimmed.indexOf(LOCAL_TOOL_CALL_PREFIX);
+  const prefixIndex = trimmed.indexOf(prefix);
   if (prefixIndex === -1) {
     return null;
   }
 
-  const payloadText = trimmed.slice(prefixIndex + LOCAL_TOOL_CALL_PREFIX.length).trim();
+  const payloadText = trimmed.slice(prefixIndex + prefix.length).trim();
   if (!payloadText) {
     return null;
   }
 
-  let payload: unknown;
   try {
-    payload = JSON.parse(payloadText);
+    return JSON.parse(payloadText);
   } catch {
     return null;
   }
+};
 
-  const parsed = payload as {
-    name?: unknown;
-    arguments?: { command?: unknown; cwd?: unknown };
-  };
+const sanitizePlanSteps = (steps: string[]): string[] => {
+  const cleaned = steps
+    .map((step) => step.trim())
+    .filter((step, index, list) => step.length > 0 && list.indexOf(step) === index);
 
-  if (parsed.name !== 'run_shell') {
+  if (cleaned.length === 0) {
+    return ['Complete the user request end-to-end.'];
+  }
+
+  return cleaned.slice(0, MAX_LOCAL_PLAN_STEPS);
+};
+
+const parseLocalPlan = (text: string): LocalExecutionPlan | null => {
+  const payload = parsePrefixedJson(text, LOCAL_PLAN_PREFIX) as { steps?: unknown } | null;
+  if (!payload) {
     return null;
   }
 
-  const command = typeof parsed.arguments?.command === 'string' ? parsed.arguments.command.trim() : '';
+  if (!Array.isArray(payload.steps)) {
+    return null;
+  }
+
+  const steps = sanitizePlanSteps(payload.steps.filter((entry): entry is string => typeof entry === 'string'));
+  return { steps };
+};
+
+const parseLocalToolCall = (text: string): LocalToolCall | null => {
+  const payload = parsePrefixedJson(text, LOCAL_TOOL_CALL_PREFIX) as {
+    name?: unknown;
+    arguments?: { command?: unknown; cwd?: unknown };
+  } | null;
+  if (!payload) {
+    return null;
+  }
+
+  if (payload.name !== 'run_shell') {
+    return null;
+  }
+
+  const command = typeof payload.arguments?.command === 'string' ? payload.arguments.command.trim() : '';
   if (!command) {
     return null;
   }
 
-  const cwd = typeof parsed.arguments?.cwd === 'string' && parsed.arguments.cwd.trim()
-    ? parsed.arguments.cwd.trim()
+  const cwd = typeof payload.arguments?.cwd === 'string' && payload.arguments.cwd.trim()
+    ? payload.arguments.cwd.trim()
     : undefined;
 
   return {
@@ -221,6 +307,41 @@ const parseLocalToolCall = (text: string): LocalToolCall | null => {
     }
   };
 };
+
+const parseLocalStepDone = (text: string): LocalStepDone | null => {
+  const payload = parsePrefixedJson(text, LOCAL_STEP_DONE_PREFIX) as { index?: unknown; note?: unknown } | null;
+  if (!payload) {
+    return null;
+  }
+
+  const index = typeof payload.index === 'number' ? Math.trunc(payload.index) : Number.NaN;
+  if (!Number.isInteger(index) || index < 1) {
+    return null;
+  }
+
+  const note = typeof payload.note === 'string' && payload.note.trim() ? payload.note.trim() : undefined;
+  return { index, note };
+};
+
+const parseLocalFinal = (text: string): LocalFinal | null => {
+  const payload = parsePrefixedJson(text, LOCAL_FINAL_PREFIX) as { message?: unknown } | null;
+  if (!payload) {
+    return null;
+  }
+
+  const message = typeof payload.message === 'string' ? payload.message.trim() : '';
+  if (!message) {
+    return null;
+  }
+
+  return { message };
+};
+
+const formatChecklist = (steps: string[], completed: boolean[]): string => (
+  steps
+    .map((step, index) => `${completed[index] ? '[x]' : '[ ]'} ${index + 1}. ${step}`)
+    .join('\n')
+);
 
 const normalizeMacUsersPath = (value: string): string => (
   process.platform === 'darwin' ? value.replace(/\/users\//gi, '/Users/') : value
@@ -248,9 +369,20 @@ const appendLimited = (current: string, chunk: string): string => {
   return `${next.slice(0, SHELL_OUTPUT_LIMIT)}\n...[truncated]`;
 };
 
+const truncateForTrace = (value: string, max = 1200): string => {
+  if (!value) {
+    return '';
+  }
+  if (value.length <= max) {
+    return value;
+  }
+  return `${value.slice(0, max)}\n...[truncated]`;
+};
+
 const runShellCommand = async (input: {
   command: string;
   cwd: string;
+  signal: AbortSignal;
 }): Promise<{
   ok: boolean;
   command: string;
@@ -260,13 +392,14 @@ const runShellCommand = async (input: {
   stdout: string;
   stderr: string;
 }> => {
+  throwIfAborted(input.signal);
   const command = normalizeMacUsersPath(input.command);
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
-    let resolved = false;
+    let settled = false;
 
     const child = spawn(command, {
       cwd: input.cwd,
@@ -281,14 +414,34 @@ const runShellCommand = async (input: {
       stdout: string;
       stderr: string;
     }) => {
-      if (resolved) return;
-      resolved = true;
+      if (settled) return;
+      settled = true;
+      input.signal.removeEventListener('abort', onAbort);
       resolve({
         command,
         cwd: input.cwd,
         ...payload
       });
     };
+
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      input.signal.removeEventListener('abort', onAbort);
+      reject(error);
+    };
+
+    const onAbort = () => {
+      try {
+        child.kill('SIGTERM');
+        setTimeout(() => child.kill('SIGKILL'), 3000);
+      } catch {
+        // ignore process kill errors
+      }
+      fail(new RequestCancelledError());
+    };
+
+    input.signal.addEventListener('abort', onAbort, { once: true });
 
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -306,13 +459,7 @@ const runShellCommand = async (input: {
 
     child.on('error', (error) => {
       clearTimeout(timeout);
-      finish({
-        ok: false,
-        exitCode: null,
-        timedOut,
-        stdout,
-        stderr: appendLimited(stderr, `\n${asMessage(error)}`)
-      });
+      fail(new Error(appendLimited(stderr, `\n${asMessage(error)}`).trim() || 'Shell command failed.'));
     });
 
     child.on('close', (exitCode) => {
@@ -331,6 +478,7 @@ const runShellCommand = async (input: {
 const executeLocalToolCall = async (input: {
   toolCall: LocalToolCall;
   workspacePath?: string;
+  signal: AbortSignal;
 }): Promise<{
   ok: boolean;
   tool: 'run_shell';
@@ -344,7 +492,8 @@ const executeLocalToolCall = async (input: {
   const cwd = resolveToolCwd(input.workspacePath, input.toolCall.arguments.cwd);
   const result = await runShellCommand({
     command: input.toolCall.arguments.command,
-    cwd
+    cwd,
+    signal: input.signal
   });
 
   return {
@@ -381,6 +530,17 @@ export const registerChatHandlers = (): void => {
     return listMessages(parsed.sessionId).map(mapMessage);
   });
 
+  ipcMain.handle('message:cancel', (_event, input) => {
+    const parsed = messageCancelSchema.parse(input);
+    const inflight = inflightRequests.get(parsed.streamId);
+    if (!inflight) {
+      return { ok: false };
+    }
+
+    inflight.cancel();
+    return { ok: true };
+  });
+
   ipcMain.handle('message:send', async (event, input) => {
     const parsed = messageSendSchema.parse(input);
     const session = getSessionById(parsed.sessionId);
@@ -390,6 +550,18 @@ export const registerChatHandlers = (): void => {
     }
 
     const streamId = parsed.streamId ?? makeStreamId();
+    const controller = new AbortController();
+
+    const inflight: InflightRequest = {
+      streamId,
+      controller,
+      cancel: () => {
+        if (!controller.signal.aborted) {
+          controller.abort(new RequestCancelledError());
+        }
+      }
+    };
+    inflightRequests.set(streamId, inflight);
 
     emitStream(event, {
       streamId,
@@ -409,6 +581,7 @@ export const registerChatHandlers = (): void => {
     let outputTokens: number | undefined;
 
     try {
+      throwIfAborted(controller.signal);
       const provider = getProviderById(session.provider_id);
       if (!provider) {
         throw new Error('Provider for this session could not be found.');
@@ -418,6 +591,7 @@ export const registerChatHandlers = (): void => {
       }
 
       const secret = await getSecret(provider.keychain_ref);
+      throwIfAborted(controller.signal);
       const workspaceId = parsed.workspaceId ?? session.workspace_id ?? null;
       const workspacePath = workspaceId ? getWorkspaceById(workspaceId)?.root_path : undefined;
       const effectiveAccessMode = parsed.accessMode ?? 'scoped';
@@ -442,6 +616,7 @@ export const registerChatHandlers = (): void => {
           cwd: workspacePath,
           model: parsed.modelId,
           fullAccess: parsed.accessMode === 'root',
+          signal: controller.signal,
           onEvent: (streamEvent) => {
             if (streamEvent.type === 'status' && streamEvent.text) {
               emitStream(event, {
@@ -491,6 +666,7 @@ export const registerChatHandlers = (): void => {
             apiKey: secret,
             model: resolveOpenAIModel(session.model_profile_id, parsed.modelId),
             history,
+            signal: controller.signal,
             onEvent: (streamEvent) => {
               if (streamEvent.type === 'status' && streamEvent.text) {
                 emitStream(event, {
@@ -527,47 +703,249 @@ export const registerChatHandlers = (): void => {
           let totalInputTokens = 0;
           let totalOutputTokens = 0;
           let finalResponse: string | null = null;
+          let plan: LocalExecutionPlan | null = null;
+          let completedSteps: boolean[] = [];
 
-          for (let step = 0; step < MAX_LOCAL_TOOL_STEPS; step += 1) {
+          for (let attempt = 0; attempt < 2 && !plan; attempt += 1) {
+            throwIfAborted(controller.signal);
             emitStream(event, {
               streamId,
               sessionId: parsed.sessionId,
               type: 'status',
-              text: step === 0 ? 'Planning next action...' : `Agent step ${step + 1}...`
+              text: 'Planning checklist...'
+            });
+            emitStream(event, {
+              streamId,
+              sessionId: parsed.sessionId,
+              type: 'text_delta',
+              text: attempt === 0 ? 'Creating execution plan...\n' : 'Retrying plan format...\n'
+            });
+
+            const planningTurn = await createOllamaCompletion({
+              baseUrl: secret ?? undefined,
+              model,
+              history: agentHistory,
+              stream: false,
+              signal: controller.signal
+            });
+
+            totalInputTokens += planningTurn.inputTokens ?? 0;
+            totalOutputTokens += planningTurn.outputTokens ?? 0;
+
+            const parsedPlan = parseLocalPlan(planningTurn.text);
+            if (parsedPlan) {
+              plan = parsedPlan;
+              completedSteps = Array(plan.steps.length).fill(false);
+              agentHistory.push({ role: 'assistant', content: planningTurn.text });
+              agentHistory.push({
+                role: 'system',
+                content: `CHECKLIST\n${formatChecklist(plan.steps, completedSteps)}`
+              });
+              emitStream(event, {
+                streamId,
+                sessionId: parsed.sessionId,
+                type: 'trace',
+                trace: {
+                  traceKind: 'plan',
+                  text: formatChecklist(plan.steps, completedSteps)
+                }
+              });
+              emitStream(event, {
+                streamId,
+                sessionId: parsed.sessionId,
+                type: 'text_delta',
+                text: `Plan (${plan.steps.length} steps):\n${plan.steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}\n`
+              });
+            } else {
+              agentHistory.push({ role: 'assistant', content: planningTurn.text });
+              agentHistory.push({
+                role: 'system',
+                content: `Invalid protocol. Respond with ${LOCAL_PLAN_PREFIX} {"steps":[...]}.`
+              });
+            }
+          }
+
+          if (!plan) {
+            throw new Error('Local agent failed to produce a valid execution plan.');
+          }
+
+          for (let step = 0; step < MAX_LOCAL_TOOL_STEPS; step += 1) {
+            throwIfAborted(controller.signal);
+            const nextStepIndex = completedSteps.findIndex((done) => !done);
+            const activeStep = nextStepIndex === -1 ? plan.steps.length : nextStepIndex + 1;
+
+            emitStream(event, {
+              streamId,
+              sessionId: parsed.sessionId,
+              type: 'status',
+              text: nextStepIndex === -1 ? 'Finalizing...' : `Executing step ${activeStep}/${plan.steps.length}...`
+            });
+            emitStream(event, {
+              streamId,
+              sessionId: parsed.sessionId,
+              type: 'text_delta',
+              text: `\nIteration ${step + 1}: ${nextStepIndex === -1 ? 'finalization' : `step ${activeStep}`}\n`
+            });
+
+            agentHistory.push({
+              role: 'system',
+              content: `CHECKLIST\n${formatChecklist(plan.steps, completedSteps)}\nCurrent step: ${activeStep}`
             });
 
             const modelTurn = await createOllamaCompletion({
               baseUrl: secret ?? undefined,
               model,
               history: agentHistory,
-              stream: false
+              stream: false,
+              signal: controller.signal
             });
 
             totalInputTokens += modelTurn.inputTokens ?? 0;
             totalOutputTokens += modelTurn.outputTokens ?? 0;
 
-            const toolCall = parseLocalToolCall(modelTurn.text);
-            if (!toolCall) {
-              finalResponse = modelTurn.text;
-              break;
-            }
-
             emitStream(event, {
               streamId,
               sessionId: parsed.sessionId,
-              type: 'status',
-              text: `Running command...`
+              type: 'trace',
+              trace: {
+                traceKind: 'action',
+                text: `Model turn ${step + 1}: ${truncateForTrace(modelTurn.text, 400)}`
+              }
             });
 
-            const toolResult = await executeLocalToolCall({
-              toolCall,
-              workspacePath
-            });
+            const stepDone = parseLocalStepDone(modelTurn.text);
+            if (stepDone) {
+              if (stepDone.index > plan.steps.length) {
+                agentHistory.push({ role: 'assistant', content: modelTurn.text });
+                agentHistory.push({
+                  role: 'system',
+                  content: `Invalid ${LOCAL_STEP_DONE_PREFIX} index ${stepDone.index}. Use 1..${plan.steps.length}.`
+                });
+                continue;
+              }
+
+              completedSteps[stepDone.index - 1] = true;
+              const checklistText = formatChecklist(plan.steps, completedSteps);
+              emitStream(event, {
+                streamId,
+                sessionId: parsed.sessionId,
+                type: 'trace',
+                trace: {
+                  traceKind: 'plan',
+                  text: checklistText
+                }
+              });
+              emitStream(event, {
+                streamId,
+                sessionId: parsed.sessionId,
+                type: 'text_delta',
+                text: `Checked off step ${stepDone.index}: ${plan.steps[stepDone.index - 1]}\n`
+              });
+
+              agentHistory.push({ role: 'assistant', content: modelTurn.text });
+              agentHistory.push({
+                role: 'system',
+                content: `CHECKLIST_UPDATED\n${checklistText}`
+              });
+              continue;
+            }
+
+            const parsedFinal = parseLocalFinal(modelTurn.text);
+            if (parsedFinal) {
+              const allDone = completedSteps.every((done) => done);
+              if (!allDone) {
+                agentHistory.push({ role: 'assistant', content: modelTurn.text });
+                agentHistory.push({
+                  role: 'system',
+                  content: `Cannot finalize yet. Remaining checklist:\n${formatChecklist(plan.steps, completedSteps)}`
+                });
+                continue;
+              }
+
+              finalResponse = parsedFinal.message;
+              emitStream(event, {
+                streamId,
+                sessionId: parsed.sessionId,
+                type: 'trace',
+                trace: {
+                  traceKind: 'plan',
+                  text: `All ${plan.steps.length} steps complete.`
+                }
+              });
+              emitStream(event, {
+                streamId,
+                sessionId: parsed.sessionId,
+                type: 'text_delta',
+                text: `${finalResponse}\n`
+              });
+              break;
+            }
+
+            const toolCall = parseLocalToolCall(modelTurn.text);
+            if (toolCall) {
+              emitStream(event, {
+                streamId,
+                sessionId: parsed.sessionId,
+                type: 'trace',
+                trace: {
+                  traceKind: 'action',
+                  text: `Step ${activeStep} command:\n${toolCall.arguments.command}\ncwd: ${toolCall.arguments.cwd ?? workspacePath ?? process.cwd()}`
+                }
+              });
+              emitStream(event, {
+                streamId,
+                sessionId: parsed.sessionId,
+                type: 'status',
+                text: 'Running command...'
+              });
+              emitStream(event, {
+                streamId,
+                sessionId: parsed.sessionId,
+                type: 'text_delta',
+                text: `$ ${toolCall.arguments.command}\n`
+              });
+
+              const toolResult = await executeLocalToolCall({
+                toolCall,
+                workspacePath,
+                signal: controller.signal
+              });
+
+              const traceResultLines = [
+                `exit: ${toolResult.exitCode ?? 'n/a'}${toolResult.timedOut ? ' (timeout)' : ''}`,
+                toolResult.stdout ? `stdout:\n${truncateForTrace(toolResult.stdout)}` : '',
+                toolResult.stderr ? `stderr:\n${truncateForTrace(toolResult.stderr)}` : ''
+              ].filter((line) => line.length > 0);
+
+              emitStream(event, {
+                streamId,
+                sessionId: parsed.sessionId,
+                type: 'trace',
+                trace: {
+                  traceKind: 'action',
+                  text: traceResultLines.join('\n\n')
+                }
+              });
+              emitStream(event, {
+                streamId,
+                sessionId: parsed.sessionId,
+                type: 'text_delta',
+                text: `exit ${toolResult.exitCode ?? 'n/a'}${toolResult.timedOut ? ' (timeout)' : ''}\n`
+              });
+
+              agentHistory.push({ role: 'assistant', content: modelTurn.text });
+              agentHistory.push({
+                role: 'system',
+                content: `TOOL_RESULT ${JSON.stringify(toolResult)}`
+              });
+              continue;
+            }
 
             agentHistory.push({ role: 'assistant', content: modelTurn.text });
             agentHistory.push({
               role: 'system',
-              content: `TOOL_RESULT ${JSON.stringify(toolResult)}`
+              content:
+                `Invalid protocol response. Use ${LOCAL_TOOL_CALL_PREFIX}, ${LOCAL_STEP_DONE_PREFIX}, or ${LOCAL_FINAL_PREFIX}.`
             });
           }
 
@@ -583,47 +961,62 @@ export const registerChatHandlers = (): void => {
         }
       }
     } catch (error) {
-      const message = asMessage(error);
-      logger.error('Completion request failed', { sessionId: parsed.sessionId, message });
-      assistantContent = `Provider request failed: ${message}`;
+      if (isCancellationError(error)) {
+        const partial = assistantContent.trim();
+        assistantContent = partial || 'Request cancelled.';
+        emitStream(event, {
+          streamId,
+          sessionId: parsed.sessionId,
+          type: 'status',
+          text: 'Cancelled'
+        });
+      } else {
+        const message = asMessage(error);
+        logger.error('Completion request failed', { sessionId: parsed.sessionId, message });
+        assistantContent = `Provider request failed: ${message}`;
+        emitStream(event, {
+          streamId,
+          sessionId: parsed.sessionId,
+          type: 'error',
+          text: assistantContent
+        });
+      }
+    }
+
+    try {
+      const assistantMessage = addMessage({
+        sessionId: parsed.sessionId,
+        role: 'assistant',
+        content: assistantContent,
+        inputTokens,
+        outputTokens
+      });
+
+      markProviderUsed(session.provider_id);
+      recordUsageEvent({
+        providerId: session.provider_id,
+        sessionId: parsed.sessionId,
+        messageId: assistantMessage.id,
+        eventType: 'completion',
+        inputTokens: inputTokens ?? Math.ceil(parsed.content.length / 4),
+        outputTokens: outputTokens ?? Math.ceil(assistantMessage.content.length / 4),
+        costMicrounits: 0
+      });
+
       emitStream(event, {
         streamId,
         sessionId: parsed.sessionId,
-        type: 'error',
-        text: assistantContent
+        type: 'done'
       });
+
+      logger.info('message.send', { sessionId: parsed.sessionId, streamId });
+
+      return {
+        userMessage: mapMessage(userMessage),
+        assistantMessage: mapMessage(assistantMessage)
+      };
+    } finally {
+      inflightRequests.delete(streamId);
     }
-
-    const assistantMessage = addMessage({
-      sessionId: parsed.sessionId,
-      role: 'assistant',
-      content: assistantContent,
-      inputTokens,
-      outputTokens
-    });
-
-    markProviderUsed(session.provider_id);
-    recordUsageEvent({
-      providerId: session.provider_id,
-      sessionId: parsed.sessionId,
-      messageId: assistantMessage.id,
-      eventType: 'completion',
-      inputTokens: inputTokens ?? Math.ceil(parsed.content.length / 4),
-      outputTokens: outputTokens ?? Math.ceil(assistantMessage.content.length / 4),
-      costMicrounits: 0
-    });
-
-    emitStream(event, {
-      streamId,
-      sessionId: parsed.sessionId,
-      type: 'done'
-    });
-
-    logger.info('message.send', { sessionId: parsed.sessionId, streamId });
-
-    return {
-      userMessage: mapMessage(userMessage),
-      assistantMessage: mapMessage(assistantMessage)
-    };
   });
 };

@@ -28,6 +28,7 @@ export type CodexCompletionInput = {
   cwd?: string;
   model?: string;
   fullAccess?: boolean;
+  signal?: AbortSignal;
   onEvent?: (event: CodexStreamEvent) => void;
 };
 
@@ -374,6 +375,13 @@ export const createCodexCompletion = async (input: CodexCompletionInput): Promis
     usage: { inputTokens?: number; outputTokens?: number };
     assistantText: string;
   }>((resolve, reject) => {
+    if (input.signal?.aborted) {
+      const abortError = new Error('Request cancelled by user.');
+      abortError.name = 'AbortError';
+      reject(abortError);
+      return;
+    }
+
     const child = spawn(resolveCodexCommand(), args, {
       stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -383,6 +391,35 @@ export const createCodexCompletion = async (input: CodexCompletionInput): Promis
     let assistantText = '';
     let usage: { inputTokens?: number; outputTokens?: number } = {};
     let lineBuffer = '';
+    let settled = false;
+    let onAbort: (() => void) | null = null;
+
+    const done = (fn: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (input.signal && onAbort) {
+        input.signal.removeEventListener('abort', onAbort);
+      }
+      fn();
+    };
+
+    onAbort = () => {
+      const abortError = new Error('Request cancelled by user.');
+      abortError.name = 'AbortError';
+      try {
+        child.kill('SIGTERM');
+        setTimeout(() => child.kill('SIGKILL'), 3000);
+      } catch {
+        // ignore process kill errors
+      }
+      done(() => reject(abortError));
+    };
+
+    if (input.signal) {
+      input.signal.addEventListener('abort', onAbort, { once: true });
+    }
 
     const processLine = (line: string) => {
       const trimmed = line.trim();
@@ -466,7 +503,7 @@ export const createCodexCompletion = async (input: CodexCompletionInput): Promis
     });
 
     child.on('error', (error) => {
-      reject(mapSpawnError(error));
+      done(() => reject(mapSpawnError(error)));
     });
 
     child.on('close', (childCode) => {
@@ -474,7 +511,7 @@ export const createCodexCompletion = async (input: CodexCompletionInput): Promis
         processLine(lineBuffer);
       }
 
-      resolve({ stdout, stderr, code: childCode, usage, assistantText });
+      done(() => resolve({ stdout, stderr, code: childCode, usage, assistantText }));
     });
   });
 

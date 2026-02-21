@@ -24,3 +24,7 @@ export const sendMessageSchema = z.object({
   sessionId: z.string().min(1),
   content: z.string().min(1)
 });
+
+export const cancelMessageSchema = z.object({
+  streamId: z.string().min(1)
+});

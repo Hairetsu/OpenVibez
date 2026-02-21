@@ -45,6 +45,10 @@ export const messageSendSchema = z.object({
   workspaceId: z.string().min(1).optional()
 });
 
+export const messageCancelSchema = z.object({
+  streamId: z.string().min(1)
+});
+
 export const messageListSchema = z.object({
   sessionId: z.string().min(1)
 });

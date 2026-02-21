@@ -1,7 +1,6 @@
 import type { Message, MessageAccessMode, MessageStreamTrace, ModelProfile, Session, Workspace } from '../../../preload/types';
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { cn } from '@/lib/utils';
 import { Composer } from './Composer';
 import { MessageList } from './MessageList';
 
@@ -12,6 +11,7 @@ type ChatViewProps = {
   onCreateSession: () => Promise<void>;
   messages: Message[];
   onSend: (content: string) => Promise<void>;
+  onCancel: () => Promise<void>;
   modelId: string;
   modelOptions: ModelProfile[];
   onModelChange: (modelId: string) => Promise<void>;
@@ -36,6 +36,7 @@ export const ChatView = ({
   onAccessModeChange,
   messages,
   onSend,
+  onCancel,
   stream
 }: ChatViewProps) => {
   const hasSelectedModel = modelOptions.some((m) => m.modelId === modelId);
@@ -74,28 +75,8 @@ export const ChatView = ({
         )}
       </div>
 
-      {stream.traces.length > 0 && (
-        <div className="scroll-soft max-h-32 overflow-auto border-b border-border/40 px-4 py-2">
-          <div className="grid gap-1.5">
-            {stream.traces.map((trace, i) => (
-              <div
-                key={`${trace.traceKind}-${i}`}
-                className={cn(
-                  'trace-card text-xs',
-                  trace.traceKind === 'plan' && 'border-primary/40',
-                  trace.traceKind === 'action' && 'border-accent/40'
-                )}
-              >
-                <span className="font-medium uppercase text-muted-foreground">{trace.traceKind}</span>
-                <p className="mt-0.5 whitespace-pre-wrap text-foreground/70">{trace.text}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <MessageList messages={messages} liveText={stream.text} streaming={stream.active} />
-      <Composer onSend={onSend} />
+      <MessageList messages={messages} traces={stream.traces} liveText={stream.text} streaming={stream.active} />
+      <Composer onSend={onSend} onCancel={onCancel} streaming={stream.active} />
     </div>
   );
 };

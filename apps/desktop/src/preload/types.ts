@@ -107,6 +107,7 @@ export type OpenVibezApi = {
       accessMode?: MessageAccessMode;
       workspaceId?: string;
     }) => Promise<{ userMessage: Message; assistantMessage: Message }>;
+    cancel: (input: { streamId: string }) => Promise<{ ok: boolean }>;
     list: (input: { sessionId: string }) => Promise<Message[]>;
     onStreamEvent: (handler: (event: MessageStreamEvent) => void) => () => void;
   };
