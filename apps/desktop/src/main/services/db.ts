@@ -299,6 +299,19 @@ export const setSessionProvider = (input: { sessionId: string; providerId: strin
   return getDb().prepare('SELECT * FROM sessions WHERE id = ?').get(input.sessionId) as SessionRow;
 };
 
+export const setSessionTitle = (input: { sessionId: string; title: string }): SessionRow => {
+  const ts = now();
+  getDb()
+    .prepare(
+      `UPDATE sessions
+       SET title = ?, updated_at = ?
+       WHERE id = ?`
+    )
+    .run(input.title, ts, input.sessionId);
+
+  return getDb().prepare('SELECT * FROM sessions WHERE id = ?').get(input.sessionId) as SessionRow;
+};
+
 export const listSessions = (): SessionRow[] => {
   return getDb()
     .prepare('SELECT * FROM sessions WHERE status != ? ORDER BY COALESCE(last_message_at, updated_at) DESC')

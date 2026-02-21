@@ -91,6 +91,10 @@ const pickModelId = (profiles: ModelProfile[], preferredModelId?: string): strin
   return profiles[0]?.modelId ?? preferredModelId ?? DEFAULT_MODEL_ID;
 };
 
+const pickModelProfileId = (profiles: ModelProfile[], modelId: string): string | undefined => {
+  return profiles.find((profile) => profile.modelId === modelId)?.id;
+};
+
 const loadModelsForProvider = async (providerId: string | null): Promise<ModelProfile[]> => {
   if (!providerId) {
     return [];
@@ -232,9 +236,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const selectedProviderId = pickProviderId(nextProviders, selectedSession?.providerId ?? providerFromSettings);
     const modelProfiles = await loadModelsForProvider(selectedProviderId);
 
-    const selectedWorkspaceId =
-      selectedSession?.workspaceId ??
-      (typeof defaultWorkspace === 'string' && defaultWorkspace ? defaultWorkspace : workspaces[0]?.id ?? null);
+    const selectedWorkspaceId = selectedSession
+      ? selectedSession.workspaceId
+      : (typeof defaultWorkspace === 'string' && defaultWorkspace ? defaultWorkspace : workspaces[0]?.id ?? null);
 
     set({
       ready: true,
@@ -284,14 +288,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     const workspaceId = state.selectedWorkspaceId ?? undefined;
-    const session = await api.session.create({ title, providerId, workspaceId });
+    const modelProfileId = pickModelProfileId(state.modelProfiles, state.selectedModelId);
+    const session = await api.session.create({ title, providerId, workspaceId, modelProfileId });
     const modelProfiles = await loadModelsForProvider(session.providerId);
     set((state) => ({
       sessions: [session, ...state.sessions],
       selectedSessionId: session.id,
       selectedProviderId: session.providerId,
       messages: [],
-      selectedWorkspaceId: session.workspaceId ?? state.selectedWorkspaceId,
+      selectedWorkspaceId: session.workspaceId,
       modelProfiles,
       selectedModelId: pickModelId(modelProfiles, state.selectedModelId)
     }));
@@ -308,7 +313,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       selectedSessionId: sessionId,
       selectedProviderId: session?.providerId ?? get().selectedProviderId,
       messages,
-      selectedWorkspaceId: session?.workspaceId ?? get().selectedWorkspaceId,
+      selectedWorkspaceId: session ? session.workspaceId : get().selectedWorkspaceId,
       modelProfiles,
       selectedModelId: pickModelId(modelProfiles, get().selectedModelId)
     });
@@ -345,7 +350,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     const sessionId = get().selectedSessionId;
     if (!sessionId) {
-      await get().createSession('New Vibe Session');
+      await get().createSession('New Session');
     }
 
     const activeSessionId = get().selectedSessionId;
@@ -373,17 +378,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
       workspaceId: get().selectedWorkspaceId ?? undefined
     });
 
-    set((state) => ({
-      messages: [...state.messages, sent.userMessage, sent.assistantMessage],
-      streaming:
-        state.streaming.streamId === streamId
-          ? {
-              ...state.streaming,
-              active: false,
-              status: state.streaming.status ?? 'Done'
-            }
-          : state.streaming
-    }));
+    const updatedSession = sent.session;
+
+    set((state) => {
+      const sessions = updatedSession
+        ? [updatedSession, ...state.sessions.filter((session) => session.id !== updatedSession.id)]
+        : state.sessions;
+
+      return {
+        messages: [...state.messages, sent.userMessage, sent.assistantMessage],
+        sessions,
+        streaming:
+          state.streaming.streamId === streamId
+            ? {
+                ...state.streaming,
+                active: false,
+                status: state.streaming.status ?? 'Done'
+              }
+            : state.streaming
+      };
+    });
 
     const usageSummary = await api.usage.summary({ days: 30 });
     set({ usageSummary });
@@ -433,7 +447,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       sessions: updatedSession
         ? current.sessions.map((session) => (session.id === updatedSession.id ? updatedSession : session))
         : current.sessions,
-      selectedWorkspaceId: updatedSession?.workspaceId ?? current.selectedWorkspaceId,
+      selectedWorkspaceId: updatedSession ? updatedSession.workspaceId : current.selectedWorkspaceId,
       modelProfiles,
       selectedModelId: pickModelId(modelProfiles, current.selectedModelId)
     }));
@@ -471,10 +485,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   setSelectedWorkspaceId: async (workspaceId) => {
-    set({ selectedWorkspaceId: workspaceId });
-    if (workspaceId) {
-      await api.settings.set({ key: 'default_workspace_id', value: workspaceId });
+    const state = get();
+    const selectedSession = state.sessions.find((session) => session.id === state.selectedSessionId) ?? null;
+    const selectedSessionMatchesWorkspace = selectedSession?.workspaceId === workspaceId;
+
+    if (selectedSessionMatchesWorkspace) {
+      set({ selectedWorkspaceId: workspaceId });
+    } else {
+      const nextSession = state.sessions.find((session) => session.workspaceId === workspaceId) ?? null;
+      const messages = nextSession ? await api.message.list({ sessionId: nextSession.id }) : [];
+      const nextProviderId = nextSession?.providerId ?? pickProviderId(state.providers, state.selectedProviderId);
+      const modelProfiles = await loadModelsForProvider(nextProviderId);
+
+      set({
+        selectedWorkspaceId: workspaceId,
+        selectedSessionId: nextSession?.id ?? null,
+        selectedProviderId: nextSession?.providerId ?? nextProviderId,
+        messages,
+        modelProfiles,
+        selectedModelId: pickModelId(modelProfiles, state.selectedModelId)
+      });
+
+      if (nextSession?.providerId) {
+        await api.settings.set({ key: 'default_provider_id', value: nextSession.providerId });
+      }
     }
+
+    await api.settings.set({ key: 'default_workspace_id', value: workspaceId });
   },
 
   setSelectedModelId: async (modelId) => {

@@ -14,6 +14,7 @@ import {
   listSessions,
   markProviderUsed,
   recordUsageEvent,
+  setSessionTitle,
   setSessionProvider
 } from '../services/db';
 import { getSecret } from '../services/keychain';
@@ -91,6 +92,9 @@ const MAX_LOCAL_TOOL_STEPS = 24;
 const SHELL_COMMAND_TIMEOUT_MS = 120_000;
 const SHELL_OUTPUT_LIMIT = 20_000;
 const MAX_LOCAL_PLAN_STEPS = 12;
+const SESSION_TITLE_MAX_LENGTH = 80;
+const SESSION_TITLE_TEXT_WINDOW = 1000;
+const SESSION_TITLE_PLACEHOLDER = /^(new vibe session|new session|session\s+\d{1,2}:\d{2}(:\d{2})?\s*(am|pm)?)$/i;
 
 class RequestCancelledError extends Error {
   constructor(message = 'Request cancelled by user.') {
@@ -131,6 +135,42 @@ const asMessage = (error: unknown): string => {
 };
 
 const makeStreamId = (): string => `stream_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
+
+const isSessionTitlePlaceholder = (title: string): boolean => {
+  const trimmed = title.trim();
+  if (!trimmed) {
+    return true;
+  }
+
+  return SESSION_TITLE_PLACEHOLDER.test(trimmed);
+};
+
+const compactWhitespace = (value: string): string => value.replace(/\s+/g, ' ').trim();
+
+const sanitizeSessionTitle = (value: string): string => {
+  const firstLine = value.trim().split(/\r?\n/, 1)[0] ?? '';
+  const withoutPrefix = firstLine.replace(/^title\s*:\s*/i, '');
+  const stripped = withoutPrefix.replace(/^[`"'“”‘’]+|[`"'“”‘’]+$/g, '');
+  const compact = compactWhitespace(stripped);
+
+  if (!compact) {
+    return '';
+  }
+
+  if (compact.length <= SESSION_TITLE_MAX_LENGTH) {
+    return compact;
+  }
+
+  return compact.slice(0, SESSION_TITLE_MAX_LENGTH).trim();
+};
+
+const clipForTitle = (value: string): string => {
+  const compact = compactWhitespace(value);
+  if (compact.length <= SESSION_TITLE_TEXT_WINDOW) {
+    return compact;
+  }
+  return `${compact.slice(0, SESSION_TITLE_TEXT_WINDOW).trim()}...`;
+};
 
 const emitStream = (
   event: IpcMainInvokeEvent,
@@ -184,6 +224,99 @@ const resolveOllamaModel = (modelProfileId: string | null, requestedModelId?: st
   }
 
   return DEFAULT_OLLAMA_MODEL;
+};
+
+const generateSessionTitle = async (input: {
+  providerId: string;
+  modelProfileId: string | null;
+  requestedModelId?: string;
+  userMessage: string;
+  assistantMessage: string;
+  signal: AbortSignal;
+}): Promise<string | null> => {
+  const provider = getProviderById(input.providerId);
+  if (!provider) {
+    return null;
+  }
+
+  const userText = clipForTitle(input.userMessage);
+  const assistantText = clipForTitle(input.assistantMessage);
+  if (!userText || !assistantText) {
+    return null;
+  }
+
+  const history: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+    {
+      role: 'system',
+      content:
+        'You generate short conversation titles. Return only a concise title (2-6 words), no quotes, no punctuation at the end.'
+    },
+    {
+      role: 'user',
+      content: [
+        'Create a title for this conversation:',
+        `User: ${userText}`,
+        `Assistant: ${assistantText}`,
+        'Return title only.'
+      ].join('\n')
+    }
+  ];
+
+  if (provider.auth_kind === 'oauth_subscription') {
+    if (provider.type !== 'openai') {
+      return null;
+    }
+
+    const completion = await createCodexCompletion({
+      history,
+      model: input.requestedModelId,
+      signal: input.signal
+    });
+
+    const title = sanitizeSessionTitle(completion.text);
+    return title || null;
+  }
+
+  if (!provider.keychain_ref) {
+    return null;
+  }
+
+  const secret = await getSecret(provider.keychain_ref);
+
+  if (provider.type === 'openai') {
+    if (!secret) {
+      return null;
+    }
+
+    const completion = await createOpenAICompletion({
+      apiKey: secret,
+      model: resolveOpenAIModel(input.modelProfileId, input.requestedModelId),
+      history,
+      temperature: 0.2,
+      maxOutputTokens: 24,
+      signal: input.signal
+    });
+
+    const title = sanitizeSessionTitle(completion.text);
+    return title || null;
+  }
+
+  if (provider.type === 'local') {
+    const completion = await createOllamaCompletion({
+      baseUrl: secret ?? undefined,
+      model: resolveOllamaModel(input.modelProfileId, input.requestedModelId),
+      history,
+      temperature: 0.2,
+      maxOutputTokens: 24,
+      stream: false,
+      signal: input.signal
+    });
+
+    const title = sanitizeSessionTitle(completion.text);
+    return title || null;
+  }
+
+  return null;
 };
 
 type LocalToolCall = {
@@ -589,6 +722,9 @@ export const registerChatHandlers = (): void => {
       text: 'Queued'
     });
 
+    const existingMessages = listMessages(parsed.sessionId);
+    const shouldGenerateSessionTitle = existingMessages.length === 0 || isSessionTitlePlaceholder(session.title);
+
     const userMessage = addMessage({
       sessionId: parsed.sessionId,
       role: 'user',
@@ -614,7 +750,7 @@ export const registerChatHandlers = (): void => {
       const workspaceId = parsed.workspaceId ?? session.workspace_id ?? null;
       const workspacePath = workspaceId ? getWorkspaceById(workspaceId)?.root_path : undefined;
       const effectiveAccessMode = parsed.accessMode ?? 'scoped';
-      const history = listMessages(parsed.sessionId)
+      const history = [...existingMessages, userMessage]
         .slice(-HISTORY_WINDOW)
         .map((message) => ({ role: message.role, content: message.content }));
 
@@ -1011,6 +1147,38 @@ export const registerChatHandlers = (): void => {
         outputTokens
       });
 
+      let latestSession = getSessionById(parsed.sessionId) ?? session;
+      const titleGenerationEligible =
+        shouldGenerateSessionTitle &&
+        assistantMessage.content.trim().length > 0 &&
+        !/^provider request failed:/i.test(assistantMessage.content.trim()) &&
+        !/^request cancelled\.?$/i.test(assistantMessage.content.trim());
+
+      if (titleGenerationEligible) {
+        try {
+          const generatedTitle = await generateSessionTitle({
+            providerId: session.provider_id,
+            modelProfileId: session.model_profile_id,
+            requestedModelId: parsed.modelId,
+            userMessage: userMessage.content,
+            assistantMessage: assistantMessage.content,
+            signal: controller.signal
+          });
+
+          if (generatedTitle && generatedTitle !== latestSession.title) {
+            latestSession = setSessionTitle({
+              sessionId: parsed.sessionId,
+              title: generatedTitle
+            });
+          }
+        } catch (error) {
+          logger.warn('Session title generation failed', {
+            sessionId: parsed.sessionId,
+            message: asMessage(error)
+          });
+        }
+      }
+
       markProviderUsed(session.provider_id);
       recordUsageEvent({
         providerId: session.provider_id,
@@ -1032,7 +1200,8 @@ export const registerChatHandlers = (): void => {
 
       return {
         userMessage: mapMessage(userMessage),
-        assistantMessage: mapMessage(assistantMessage)
+        assistantMessage: mapMessage(assistantMessage),
+        session: mapSession(latestSession)
       };
     } finally {
       inflightRequests.delete(streamId);

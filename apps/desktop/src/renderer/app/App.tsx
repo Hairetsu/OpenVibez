@@ -17,9 +17,11 @@ export const App = () => {
   }, [store.initialize]);
 
   const onCreateSession = useCallback(
-    () => store.createSession(`Session ${new Date().toLocaleTimeString()}`),
+    () => store.createSession('New Session'),
     [store.createSession]
   );
+
+  const visibleSessions = store.sessions.filter((session) => session.workspaceId === store.selectedWorkspaceId);
 
   return (
     <div className="flex h-screen flex-col overflow-hidden">
@@ -60,7 +62,7 @@ export const App = () => {
         <SessionSidebar
           collapsed={sidebarCollapsed}
           onToggle={() => setSidebarCollapsed((v) => !v)}
-          sessions={store.sessions}
+          sessions={visibleSessions}
           selectedSessionId={store.selectedSessionId}
           onSelectSession={store.selectSession}
           onCreateSession={onCreateSession}
@@ -73,7 +75,7 @@ export const App = () => {
         <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
           {activePage === 'chat' ? (
             <ChatView
-              sessions={store.sessions}
+              sessions={visibleSessions}
               selectedSessionId={store.selectedSessionId}
               onSelectSession={store.selectSession}
               onCreateSession={onCreateSession}
