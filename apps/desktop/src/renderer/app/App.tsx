@@ -95,6 +95,8 @@ export const App = () => {
               <div className="mx-auto grid max-w-2xl gap-4">
                 <ProviderSettings
                   providers={store.providers}
+                  activeProviderId={store.selectedProviderId}
+                  onSelectProvider={store.setSelectedProviderId}
                   onCreateProvider={store.createProvider}
                   onSaveSecret={store.saveProviderSecret}
                   onTestProvider={store.testProvider}

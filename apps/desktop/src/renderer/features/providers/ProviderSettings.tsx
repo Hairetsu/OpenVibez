@@ -9,6 +9,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 
 type ProviderSettingsProps = {
   providers: Provider[];
+  activeProviderId: string | null;
+  onSelectProvider: (providerId: string) => Promise<void>;
   onCreateProvider: (input: { displayName: string; authKind: Provider['authKind']; type?: Provider['type'] }) => Promise<void>;
   onSaveSecret: (providerId: string, secret: string) => Promise<{ ok: boolean }>;
   onTestProvider: (providerId: string) => Promise<{ ok: boolean; status?: number; reason?: string; models?: ModelProfile[] }>;
@@ -28,6 +30,8 @@ const formatSuccessMessage = (models?: ModelProfile[]): string => {
 
 export const ProviderSettings = ({
   providers,
+  activeProviderId,
+  onSelectProvider,
   onCreateProvider,
   onSaveSecret,
   onTestProvider,
@@ -35,7 +39,6 @@ export const ProviderSettings = ({
   onStartSubscriptionLogin,
   onGetSubscriptionLoginState
 }: ProviderSettingsProps) => {
-  const [activeProviderId, setActiveProviderId] = useState<string>(providers[0]?.id ?? '');
   const [apiKey, setApiKey] = useState('');
   const [localEndpoint, setLocalEndpoint] = useState('');
   const [status, setStatus] = useState<string | null>(null);
@@ -43,18 +46,6 @@ export const ProviderSettings = ({
   const [newProviderType, setNewProviderType] = useState<Provider['type']>('openai');
   const [newAuthKind, setNewAuthKind] = useState<Provider['authKind']>('api_key');
   const [subscriptionState, setSubscriptionState] = useState<ProviderSubscriptionLoginState | null>(null);
-
-  useEffect(() => {
-    if (!providers.length) {
-      setActiveProviderId('');
-      return;
-    }
-
-    const exists = providers.some((provider) => provider.id === activeProviderId);
-    if (!exists) {
-      setActiveProviderId(providers[0].id);
-    }
-  }, [activeProviderId, providers]);
 
   useEffect(() => {
     if (newProviderType === 'local') {
@@ -72,9 +63,14 @@ export const ProviderSettings = ({
     }
   }, [newAuthKind, newProviderName, newProviderType]);
 
-  const activeProvider = useMemo(
-    () => providers.find((provider) => provider.id === activeProviderId) ?? null,
+  const resolvedActiveProviderId = useMemo(
+    () => (activeProviderId && providers.some((provider) => provider.id === activeProviderId) ? activeProviderId : providers[0]?.id ?? ''),
     [activeProviderId, providers]
+  );
+
+  const activeProvider = useMemo(
+    () => providers.find((provider) => provider.id === resolvedActiveProviderId) ?? null,
+    [providers, resolvedActiveProviderId]
   );
 
   const onCreate = async () => {
@@ -89,10 +85,10 @@ export const ProviderSettings = ({
 
   const onSubmitApiKey = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!activeProviderId || !apiKey.trim()) return;
+    if (!resolvedActiveProviderId || !apiKey.trim()) return;
 
-    await onSaveSecret(activeProviderId, apiKey.trim());
-    const result = await onTestProvider(activeProviderId);
+    await onSaveSecret(resolvedActiveProviderId, apiKey.trim());
+    const result = await onTestProvider(resolvedActiveProviderId);
     setStatus(result.ok
       ? formatSuccessMessage(result.models)
       : `Failed (${result.status ?? 'n/a'})${result.reason ? `: ${result.reason}` : ''}`
@@ -101,11 +97,11 @@ export const ProviderSettings = ({
 
   const onSubmitLocalEndpoint = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!activeProviderId) return;
+    if (!resolvedActiveProviderId) return;
 
-    await onSaveSecret(activeProviderId, localEndpoint.trim());
+    await onSaveSecret(resolvedActiveProviderId, localEndpoint.trim());
 
-    const result = await onTestProvider(activeProviderId);
+    const result = await onTestProvider(resolvedActiveProviderId);
     setStatus(result.ok
       ? formatSuccessMessage(result.models)
       : `Failed (${result.status ?? 'n/a'})${result.reason ? `: ${result.reason}` : ''}`
@@ -113,8 +109,8 @@ export const ProviderSettings = ({
   };
 
   const onCheckSupport = async () => {
-    if (!activeProviderId) return;
-    const result = await onTestProvider(activeProviderId);
+    if (!resolvedActiveProviderId) return;
+    const result = await onTestProvider(resolvedActiveProviderId);
     setStatus(result.ok
       ? formatSuccessMessage(result.models)
       : `Failed (${result.status ?? 'n/a'})${result.reason ? `: ${result.reason}` : ''}`
@@ -122,12 +118,12 @@ export const ProviderSettings = ({
   };
 
   const onConnectChatGPT = async () => {
-    if (!activeProviderId) return;
-    const nextState = await onStartSubscriptionLogin(activeProviderId);
+    if (!resolvedActiveProviderId) return;
+    const nextState = await onStartSubscriptionLogin(resolvedActiveProviderId);
     setSubscriptionState(nextState);
 
     if (nextState.status === 'success') {
-      const result = await onTestProvider(activeProviderId);
+      const result = await onTestProvider(resolvedActiveProviderId);
       setStatus(result.ok ? formatSuccessMessage(result.models) : `Failed (${result.status ?? 'n/a'})`);
       return;
     }
@@ -140,8 +136,8 @@ export const ProviderSettings = ({
     const next = await onGetSubscriptionLoginState();
     setSubscriptionState(next);
 
-    if (next.status === 'success' && activeProviderId) {
-      const result = await onTestProvider(activeProviderId);
+    if (next.status === 'success' && resolvedActiveProviderId) {
+      const result = await onTestProvider(resolvedActiveProviderId);
       setStatus(result.ok ? formatSuccessMessage(result.models) : `Failed (${result.status ?? 'n/a'})`);
       return;
     }
@@ -180,8 +176,14 @@ export const ProviderSettings = ({
         <div className="grid gap-2">
           <Label className="text-xs">Active provider</Label>
           <Select
-            value={activeProviderId || '__none__'}
-            onValueChange={(v) => { setActiveProviderId(v === '__none__' ? '' : v); setStatus(null); }}
+            value={resolvedActiveProviderId || '__none__'}
+            onValueChange={(v) => {
+              if (v === '__none__') {
+                return;
+              }
+              setStatus(null);
+              void onSelectProvider(v);
+            }}
           >
             <SelectTrigger><SelectValue placeholder="Select" /></SelectTrigger>
             <SelectContent>

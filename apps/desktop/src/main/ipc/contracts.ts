@@ -32,6 +32,11 @@ export const sessionCreateSchema = z.object({
   modelProfileId: z.string().optional()
 });
 
+export const sessionSetProviderSchema = z.object({
+  sessionId: z.string().min(1),
+  providerId: z.string().min(1)
+});
+
 export const sessionArchiveSchema = z.object({
   sessionId: z.string().min(1)
 });

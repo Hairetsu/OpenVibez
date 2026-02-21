@@ -30,6 +30,7 @@ type ChatState = {
   modelProfiles: ModelProfile[];
   messages: Message[];
   selectedSessionId: string | null;
+  selectedProviderId: string | null;
   selectedWorkspaceId: string | null;
   selectedModelId: string;
   accessMode: MessageAccessMode;
@@ -41,6 +42,7 @@ type ChatState = {
   selectSession: (sessionId: string) => Promise<void>;
   sendMessage: (content: string) => Promise<void>;
   cancelMessage: () => Promise<void>;
+  setSelectedProviderId: (providerId: string) => Promise<void>;
   saveProviderSecret: (providerId: string, secret: string) => Promise<{ ok: boolean }>;
   testProvider: (providerId: string) => Promise<{ ok: boolean; status?: number; reason?: string; models?: ModelProfile[] }>;
   addWorkspace: (path: string) => Promise<void>;
@@ -57,9 +59,21 @@ const CANCEL_WAIT_TIMEOUT_MS = 4000;
 
 let streamUnsubscribe: (() => void) | null = null;
 
-const pickProviderId = (providers: Provider[]): string | null => providers[0]?.id ?? null;
+const pickProviderId = (providers: Provider[], preferred?: string | null): string | null => {
+  if (preferred && providers.some((provider) => provider.id === preferred)) {
+    return preferred;
+  }
 
-const getActiveProviderId = (state: Pick<ChatState, 'sessions' | 'selectedSessionId' | 'providers'>): string | null => {
+  return providers[0]?.id ?? null;
+};
+
+const getActiveProviderId = (
+  state: Pick<ChatState, 'selectedProviderId' | 'sessions' | 'selectedSessionId' | 'providers'>
+): string | null => {
+  if (state.selectedProviderId && state.providers.some((provider) => provider.id === state.selectedProviderId)) {
+    return state.selectedProviderId;
+  }
+
   const sessionProviderId = state.sessions.find((session) => session.id === state.selectedSessionId)?.providerId;
   return sessionProviderId ?? state.providers[0]?.id ?? null;
 };
@@ -173,6 +187,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   modelProfiles: [],
   messages: [],
   selectedSessionId: null,
+  selectedProviderId: null,
   selectedWorkspaceId: null,
   selectedModelId: DEFAULT_MODEL_ID,
   accessMode: 'scoped',
@@ -189,13 +204,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({ loading: true });
     ensureStreamListener(set, get);
 
-    const [providers, sessions, workspaces, usageSummary, defaultModel, defaultWorkspace] = await Promise.all([
+    const [providers, sessions, workspaces, usageSummary, defaultModel, defaultWorkspace, defaultProvider] = await Promise.all([
       api.provider.list(),
       api.session.list(),
       api.workspace.list(),
       api.usage.summary({ days: 30 }),
       api.settings.get({ key: 'default_model_id' }),
-      api.settings.get({ key: 'default_workspace_id' })
+      api.settings.get({ key: 'default_workspace_id' }),
+      api.settings.get({ key: 'default_provider_id' })
     ]);
 
     let nextProviders = providers;
@@ -211,8 +227,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const selectedSessionId = sessions[0]?.id ?? null;
     const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
     const messages = selectedSessionId ? await api.message.list({ sessionId: selectedSessionId }) : [];
-    const activeProviderId = selectedSession?.providerId ?? nextProviders[0]?.id ?? null;
-    const modelProfiles = await loadModelsForProvider(activeProviderId);
+    const providerFromSettings =
+      typeof defaultProvider === 'string' && defaultProvider.trim() ? defaultProvider.trim() : null;
+    const selectedProviderId = pickProviderId(nextProviders, selectedSession?.providerId ?? providerFromSettings);
+    const modelProfiles = await loadModelsForProvider(selectedProviderId);
 
     const selectedWorkspaceId =
       selectedSession?.workspaceId ??
@@ -226,6 +244,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       workspaces,
       modelProfiles,
       selectedSessionId,
+      selectedProviderId,
       selectedWorkspaceId,
       messages,
       usageSummary,
@@ -240,26 +259,44 @@ export const useChatStore = create<ChatState>((set, get) => ({
       authKind: input.authKind
     });
 
-    set((state) => ({ providers: [provider, ...state.providers] }));
+    const hadSelectedProvider = Boolean(get().selectedProviderId);
+    set((state) => {
+      const selectedProviderId = state.selectedProviderId ?? provider.id;
+      return { providers: [provider, ...state.providers], selectedProviderId };
+    });
+
+    if (!hadSelectedProvider) {
+      await api.settings.set({ key: 'default_provider_id', value: provider.id });
+      const modelProfiles = await loadModelsForProvider(provider.id);
+      set((state) => ({
+        selectedProviderId: provider.id,
+        modelProfiles,
+        selectedModelId: pickModelId(modelProfiles, state.selectedModelId)
+      }));
+    }
   },
 
   createSession: async (title: string) => {
-    const providerId = pickProviderId(get().providers);
+    const state = get();
+    const providerId = pickProviderId(state.providers, state.selectedProviderId);
     if (!providerId) {
       return;
     }
 
-    const workspaceId = get().selectedWorkspaceId ?? undefined;
+    const workspaceId = state.selectedWorkspaceId ?? undefined;
     const session = await api.session.create({ title, providerId, workspaceId });
     const modelProfiles = await loadModelsForProvider(session.providerId);
     set((state) => ({
       sessions: [session, ...state.sessions],
       selectedSessionId: session.id,
+      selectedProviderId: session.providerId,
       messages: [],
       selectedWorkspaceId: session.workspaceId ?? state.selectedWorkspaceId,
       modelProfiles,
       selectedModelId: pickModelId(modelProfiles, state.selectedModelId)
     }));
+
+    await api.settings.set({ key: 'default_provider_id', value: session.providerId });
   },
 
   selectSession: async (sessionId: string) => {
@@ -269,11 +306,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     set({
       selectedSessionId: sessionId,
+      selectedProviderId: session?.providerId ?? get().selectedProviderId,
       messages,
       selectedWorkspaceId: session?.workspaceId ?? get().selectedWorkspaceId,
       modelProfiles,
       selectedModelId: pickModelId(modelProfiles, get().selectedModelId)
     });
+
+    if (session?.providerId) {
+      await api.settings.set({ key: 'default_provider_id', value: session.providerId });
+    }
   },
 
   sendMessage: async (content: string) => {
@@ -361,6 +403,40 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
 
     await api.message.cancel({ streamId });
+  },
+
+  setSelectedProviderId: async (providerId) => {
+    const nextProviderId = providerId.trim();
+    if (!nextProviderId) {
+      return;
+    }
+
+    const state = get();
+    if (!state.providers.some((provider) => provider.id === nextProviderId)) {
+      return;
+    }
+
+    set({ selectedProviderId: nextProviderId });
+    await api.settings.set({ key: 'default_provider_id', value: nextProviderId });
+
+    let updatedSession: Session | null = null;
+    if (state.selectedSessionId) {
+      updatedSession = await api.session.setProvider({
+        sessionId: state.selectedSessionId,
+        providerId: nextProviderId
+      });
+    }
+
+    const modelProfiles = await loadModelsForProvider(nextProviderId);
+    set((current) => ({
+      selectedProviderId: nextProviderId,
+      sessions: updatedSession
+        ? current.sessions.map((session) => (session.id === updatedSession.id ? updatedSession : session))
+        : current.sessions,
+      selectedWorkspaceId: updatedSession?.workspaceId ?? current.selectedWorkspaceId,
+      modelProfiles,
+      selectedModelId: pickModelId(modelProfiles, current.selectedModelId)
+    }));
   },
 
   saveProviderSecret: async (providerId, secret) => {

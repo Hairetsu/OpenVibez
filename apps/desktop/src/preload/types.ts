@@ -95,6 +95,7 @@ export type OpenVibezApi = {
   };
   session: {
     create: (input: { title: string; providerId: string; workspaceId?: string; modelProfileId?: string }) => Promise<Session>;
+    setProvider: (input: { sessionId: string; providerId: string }) => Promise<Session>;
     list: () => Promise<Session[]>;
     archive: (input: { sessionId: string }) => Promise<{ ok: boolean }>;
   };

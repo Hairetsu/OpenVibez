@@ -13,14 +13,22 @@ import {
   listMessages,
   listSessions,
   markProviderUsed,
-  recordUsageEvent
+  recordUsageEvent,
+  setSessionProvider
 } from '../services/db';
 import { getSecret } from '../services/keychain';
 import { createCodexCompletion, getCodexLoginStatus } from '../services/providers/codex';
 import { createOllamaCompletion } from '../services/providers/ollama';
 import { createOpenAICompletion } from '../services/providers/openai';
 import { logger } from '../util/logger';
-import { messageCancelSchema, messageListSchema, messageSendSchema, sessionArchiveSchema, sessionCreateSchema } from './contracts';
+import {
+  messageCancelSchema,
+  messageListSchema,
+  messageSendSchema,
+  sessionArchiveSchema,
+  sessionCreateSchema,
+  sessionSetProviderSchema
+} from './contracts';
 
 const mapSession = (row: {
   id: string;
@@ -512,6 +520,17 @@ export const registerChatHandlers = (): void => {
   ipcMain.handle('session:create', (_event, input) => {
     const parsed = sessionCreateSchema.parse(input);
     const session = createSession(parsed);
+    return mapSession(session);
+  });
+
+  ipcMain.handle('session:setProvider', (_event, input) => {
+    const parsed = sessionSetProviderSchema.parse(input);
+    const provider = getProviderById(parsed.providerId);
+    if (!provider) {
+      throw new Error('Provider not found');
+    }
+
+    const session = setSessionProvider(parsed);
     return mapSession(session);
   });
 

@@ -14,6 +14,7 @@ const api: OpenVibezApi = {
   },
   session: {
     create: (input) => ipcRenderer.invoke('session:create', input),
+    setProvider: (input) => ipcRenderer.invoke('session:setProvider', input),
     list: () => ipcRenderer.invoke('session:list'),
     archive: (input) => ipcRenderer.invoke('session:archive', input)
   },
