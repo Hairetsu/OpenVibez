@@ -7,7 +7,7 @@ OpenVibez gives you a native chat interface that connects to the AI providers yo
 ![Chat View](docs/screenshots/chat-empty.png)
 ![Settings](docs/screenshots/settings.png)
 
-> **Status:** Early alpha. Core chat loop works with OpenAI API keys, ChatGPT subscriptions, and local Ollama models. Multi-provider expansion and agent tooling are in progress.
+> **Status:** Early alpha. Core chat loop works with OpenAI API keys, ChatGPT subscriptions, and local Ollama models, including autonomous local CLI execution and cancellable runs.
 
 ---
 
@@ -84,6 +84,17 @@ npm run db:studio
 
 ---
 
+## Recent Improvements
+
+- **Local tool-calling agent loop (Ollama)** — local models now receive a strict tool protocol and can run iterative CLI actions (`run_shell`) until tasks are complete.
+- **Checklist-driven execution** — local runs now require an explicit plan, step checkoffs, and finalization only after all steps are complete.
+- **Inline iteration feed** — action traces (planned steps, commands, exit codes, truncated stdout/stderr) now render directly in the message feed.
+- **Cross-provider cancel support** — active runs can be cancelled from the composer button for OpenAI, Codex subscription, and local/Ollama sessions.
+- **Send-vs-cancel composer behavior** — when text exists, pressing the button sends new input; when empty during an active run, it cancels the run.
+- **Interrupt-and-replace flow** — sending a new message during an active run now cancels the in-flight run first, then starts the new request.
+
+---
+
 ## What's Built
 
 - [x] Electron shell with frameless macOS title bar and native drag region
@@ -91,10 +102,13 @@ npm run db:studio
 - [x] API key auth with OS keychain storage (keytar)
 - [x] ChatGPT subscription auth via Codex CLI device login
 - [x] Local model support via Ollama (default `http://127.0.0.1:11434`)
+- [x] Local CLI tool execution loop (`run_shell`) with multi-step autonomous task completion
+- [x] Plan/checklist enforcement for local agent runs
 - [x] Model discovery — auto-sync available models from provider
 - [x] Session management — create, switch, persist conversations
 - [x] Streaming chat with real-time text deltas
-- [x] Trace visualization — thought, plan, and action traces during execution
+- [x] Trace visualization — thought, plan, and action traces during execution (inline in message feed)
+- [x] Cancel in-flight requests (OpenAI, Codex, and local/Ollama)
 - [x] Workspace scoping — attach project directories, control execution sandbox
 - [x] Scoped vs root execution modes
 - [x] Token usage tracking with 30-day cost summary
