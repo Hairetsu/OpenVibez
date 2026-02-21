@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    @apply m-0 min-h-full w-full;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-body);
+    background: hsl(var(--background));
+    overflow: hidden;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-display);
+    letter-spacing: 0.02em;
+  }
+}
+
+@layer utilities {
+  .title-bar {
+    -webkit-app-region: drag;
+  }
+
+  .title-bar button,
+  .title-bar [role="tablist"],
+  .title-bar a,
+  .title-bar input,
+  .title-bar select {
+    -webkit-app-region: no-drag;
+  }
+
+  .display-font {
+    font-family: var(--font-display);
+  }
+
+  .scroll-soft {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+
+  .scroll-soft::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .scroll-soft::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scroll-soft::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 3px;
+  }
+
+  .trace-card {
+    @apply rounded-lg border border-border/60 bg-background/30 px-3 py-2;
+  }
+}

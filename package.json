@@ -1,0 +1,23 @@
+{
+  "name": "openvibez",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenVibez desktop client scaffold",
+  "workspaces": [
+    "apps/desktop",
+    "packages/shared"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @openvibez/desktop",
+    "build": "npm run build --workspace @openvibez/desktop",
+    "typecheck": "npm run typecheck --workspace @openvibez/desktop",
+    "db:generate": "drizzle-kit generate --config ./db/drizzle.config.ts",
+    "db:studio": "drizzle-kit studio --config ./db/drizzle.config.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.44.7"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.4"
+  }
+}

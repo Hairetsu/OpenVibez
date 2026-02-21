@@ -1,0 +1,38 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+  --font-display: 'Inter', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --background: 220 13% 9%;
+  --foreground: 220 13% 91%;
+
+  --card: 220 13% 11%;
+  --card-foreground: 220 13% 91%;
+
+  --popover: 220 14% 10%;
+  --popover-foreground: 220 13% 91%;
+
+  --primary: 213 94% 56%;
+  --primary-foreground: 220 13% 98%;
+
+  --secondary: 220 14% 16%;
+  --secondary-foreground: 220 13% 91%;
+
+  --muted: 220 12% 16%;
+  --muted-foreground: 220 10% 54%;
+
+  --accent: 213 94% 56%;
+  --accent-foreground: 220 13% 98%;
+
+  --destructive: 0 72% 56%;
+  --destructive-foreground: 220 13% 98%;
+
+  --border: 220 12% 18%;
+  --input: 220 12% 18%;
+  --ring: 213 94% 56%;
+  --radius: 0.5rem;
+
+  --shadow: 220 30% 3%;
+}
