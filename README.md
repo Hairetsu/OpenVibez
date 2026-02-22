@@ -9,6 +9,9 @@ OpenVibez gives you a native chat interface that connects to the AI providers yo
 
 > **Status:** Early alpha. Core chat loop works with OpenAI API keys, ChatGPT subscriptions, and local Ollama models, including autonomous local CLI execution and cancellable runs.
 
+> [!WARNING]
+> **This is very early alpha software.** I've directed the vision, but fully embraced the vibes while building it — and it shows. OpenVibez has direct CLI access and can be given root execution privileges. **I take zero responsibility** for what happens if you hand it the keys to your system. This is a fun experiment, not production software. Use at your own risk.
+
 ---
 
 ## Why OpenVibez
