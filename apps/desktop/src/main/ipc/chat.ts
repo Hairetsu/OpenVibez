@@ -179,7 +179,7 @@ const emitStream = (
     sessionId: string;
     type: 'status' | 'trace' | 'text_delta' | 'error' | 'done';
     text?: string;
-    trace?: { traceKind: 'thought' | 'plan' | 'action'; text: string };
+    trace?: { traceKind: 'thought' | 'plan' | 'action'; text: string; actionKind?: string };
   }
 ): void => {
   try {
@@ -790,7 +790,8 @@ export const registerChatHandlers = (): void => {
                 type: 'trace',
                 trace: {
                   traceKind: streamEvent.traceKind,
-                  text: streamEvent.text
+                  text: streamEvent.text,
+                  actionKind: streamEvent.actionKind
                 }
               });
               return;
@@ -964,7 +965,8 @@ export const registerChatHandlers = (): void => {
               type: 'trace',
               trace: {
                 traceKind: 'action',
-                text: `Model turn ${step + 1}: ${truncateForTrace(modelTurn.text, 400)}`
+                text: `Model turn ${step + 1}: ${truncateForTrace(modelTurn.text, 400)}`,
+                actionKind: 'generic'
               }
             });
 
@@ -1044,7 +1046,8 @@ export const registerChatHandlers = (): void => {
                 type: 'trace',
                 trace: {
                   traceKind: 'action',
-                  text: `Step ${activeStep} command:\n${toolCall.arguments.command}\ncwd: ${toolCall.arguments.cwd ?? workspacePath ?? process.cwd()}`
+                  text: `Step ${activeStep} command:\n${toolCall.arguments.command}\ncwd: ${toolCall.arguments.cwd ?? workspacePath ?? process.cwd()}`,
+                  actionKind: 'command'
                 }
               });
               emitStream(event, {
@@ -1078,7 +1081,8 @@ export const registerChatHandlers = (): void => {
                 type: 'trace',
                 trace: {
                   traceKind: 'action',
-                  text: traceResultLines.join('\n\n')
+                  text: traceResultLines.join('\n\n'),
+                  actionKind: 'command-result'
                 }
               });
               emitStream(event, {

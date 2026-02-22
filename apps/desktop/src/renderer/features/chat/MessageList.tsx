@@ -1,272 +1,252 @@
-import { useEffect, useMemo, useRef } from 'react';
-import type { Message, MessageStreamTrace } from '../../../preload/types';
-import { cn } from '@/lib/utils';
-import type { LucideIcon } from 'lucide-react';
+import { useEffect, useMemo, useRef } from "react";
+import type { Message, MessageStreamTrace } from "../../../preload/types";
+import type { StreamTimelineEntry } from "./chat.store";
+import { cn } from "@/lib/utils";
 import {
-  BrainCircuit,
   CheckCircle2,
+  ChevronRight,
   Circle,
   FileCode2,
-  ListChecks,
+  FilePenLine,
   Loader2,
-  Sparkles,
-  TerminalSquare
-} from 'lucide-react';
+  Search,
+  TerminalSquare,
+} from "lucide-react";
 
 type MessageListProps = {
   messages: Message[];
   liveText?: string;
   streaming?: boolean;
   traces?: MessageStreamTrace[];
+  timeline?: StreamTimelineEntry[];
   status?: string | null;
   statusTrail?: string[];
 };
 
-type TraceMeta = {
-  label: string;
-  icon: LucideIcon;
-  accentClass: string;
-  cardClass: string;
-};
+type ChecklistItem = { done: boolean; index: number; text: string };
 
-type ChecklistItem = {
-  done: boolean;
-  index: number;
-  text: string;
-};
+type FileEdit = { path: string; verb: string; added: number; removed: number };
 
-type ParsedTrace =
+type ActionSummary =
+  | { type: "edited"; files: FileEdit[]; raw: string }
+  | { type: "command"; command: string; cwd: string | null; raw: string }
   | {
-      kind: 'checklist';
-      items: ChecklistItem[];
-      fileLocations: string[];
-      changeSummary: string | null;
-    }
-  | {
-      kind: 'command';
-      step: number | null;
-      command: string;
-      cwd: string | null;
-      fileLocations: string[];
-      changeSummary: string | null;
-    }
-  | {
-      kind: 'result';
+      type: "result";
       exit: string | null;
       timedOut: boolean;
       stdout: string | null;
       stderr: string | null;
-      fileLocations: string[];
-      changeSummary: string | null;
     }
-  | {
-      kind: 'note';
-      text: string;
-      fileLocations: string[];
-      changeSummary: string | null;
-    };
-
-const TRACE_META: Record<MessageStreamTrace['traceKind'], TraceMeta> = {
-  thought: {
-    label: 'Thought',
-    icon: BrainCircuit,
-    accentClass: 'text-amber-300',
-    cardClass: 'border-amber-300/30 bg-amber-300/10'
-  },
-  plan: {
-    label: 'Plan',
-    icon: ListChecks,
-    accentClass: 'text-sky-300',
-    cardClass: 'border-sky-300/30 bg-sky-300/10'
-  },
-  action: {
-    label: 'Action',
-    icon: TerminalSquare,
-    accentClass: 'text-emerald-300',
-    cardClass: 'border-emerald-300/30 bg-emerald-300/10'
-  }
-};
+  | { type: "explored"; count: number; detail: string; raw: string }
+  | { type: "checklist"; items: ChecklistItem[] }
+  | { type: "text"; content: string; files: string[] };
 
 const CHECKLIST_LINE = /^\[(x| )\]\s+(\d+)\.\s+(.+)$/i;
 const FILE_LOCATION_PATTERN =
   /(?:^|[\s`"'([{])((?:\/|\.{1,2}\/)?(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+(?::\d+(?::\d+)?)?(?:#L\d+(?:C\d+)?)?)/g;
-
-const compactStatuses = (trail: string[], latest: string | null | undefined): string[] => {
-  const base = trail.length > 0 ? trail : (latest ? [latest] : []);
-  if (base.length === 0) {
-    return [];
-  }
-
-  return base.filter((status, index) => status.trim() && (index === 0 || status !== base[index - 1]));
-};
+const FILE_OP_PATTERN = /\*\*\*\s+(Add|Update|Delete)\s+File:\s*(.+)/g;
+const SEARCH_PATTERN = /\b(?:Searched\s+for|Explored|search|grep|rg\s|find\s)/i;
 
 const extractFileLocations = (text: string): string[] => {
   const matches: string[] = [];
   for (const found of text.matchAll(FILE_LOCATION_PATTERN)) {
-    const value = found[1]?.trim().replace(/[),.;]+$/, '');
-    if (!value || /^https?:\/\//i.test(value)) {
-      continue;
-    }
+    const value = found[1]?.trim().replace(/[),.;]+$/, "");
+    if (!value || /^https?:\/\//i.test(value)) continue;
     matches.push(value);
   }
-
   return [...new Set(matches)].slice(0, 8);
 };
 
-const extractChangeSummary = (text: string): string | null => {
-  const gitSummary = text.match(
-    /(\d+)\s+files?\s+changed(?:,\s*(\d+)\s+insertions?\(\+\))?(?:,\s*(\d+)\s+deletions?\(-\))?/i
-  );
-  if (gitSummary) {
-    const files = Number(gitSummary[1]);
-    const insertions = gitSummary[2] ? Number(gitSummary[2]) : 0;
-    const deletions = gitSummary[3] ? Number(gitSummary[3]) : 0;
-    const details = [`${files} file${files === 1 ? '' : 's'} changed`];
-    if (insertions > 0) details.push(`+${insertions}`);
-    if (deletions > 0) details.push(`-${deletions}`);
-    return details.join(' ');
+const parseFileEdits = (text: string): FileEdit[] | null => {
+  const edits: FileEdit[] = [];
+  for (const m of text.matchAll(FILE_OP_PATTERN)) {
+    const verb = m[1].toLowerCase();
+    const filePath = m[2].trim();
+    const section = text.slice(m.index! + m[0].length);
+    const nextOp = section.search(/\*\*\*\s+(?:Add|Update|Delete)\s+File:/);
+    const chunk = nextOp === -1 ? section : section.slice(0, nextOp);
+    let added = 0;
+    let removed = 0;
+    for (const line of chunk.split("\n")) {
+      if (/^\+[^+]/.test(line)) added++;
+      if (/^-[^-]/.test(line)) removed++;
+    }
+    edits.push({ path: filePath, verb, added, removed });
   }
-
-  const patchOps = (text.match(/\*\*\*\s+(?:Add|Update|Delete)\s+File:/g) ?? []).length;
-  if (patchOps > 0) {
-    return `${patchOps} file${patchOps === 1 ? '' : 's'} changed`;
-  }
-
-  return null;
+  return edits.length > 0 ? edits : null;
 };
 
 const parseChecklist = (text: string): ChecklistItem[] | null => {
   const lines = text
     .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  if (lines.length === 0) {
-    return null;
-  }
-
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return null;
   const parsed = lines.map((line) => {
     const match = line.match(CHECKLIST_LINE);
-    if (!match) {
-      return null;
-    }
-
+    if (!match) return null;
     return {
-      done: match[1].toLowerCase() === 'x',
+      done: match[1].toLowerCase() === "x",
       index: Number(match[2]),
-      text: match[3].trim()
-    } satisfies ChecklistItem;
+      text: match[3].trim(),
+    };
   });
-
-  if (parsed.some((entry) => !entry)) {
-    return null;
-  }
-
+  if (parsed.some((e) => !e)) return null;
   return parsed as ChecklistItem[];
 };
 
-const parseCommand = (text: string): { step: number | null; command: string; cwd: string | null } | null => {
+const parseCommand = (
+  text: string,
+): { command: string; cwd: string | null } | null => {
   const lines = text.split(/\r?\n/);
-  if (lines.length < 2) {
-    return null;
-  }
-
-  const headerMatch = lines[0]?.trim().match(/^Step\s+(\d+)\s+command:\s*$/i);
-  if (!headerMatch) {
-    return null;
-  }
-
-  const cwdIndex = lines.findIndex((line, index) => index > 0 && /^cwd:\s*/i.test(line.trim()));
+  if (lines.length < 2) return null;
+  if (!/^Step\s+\d+\s+command:\s*$/i.test(lines[0]?.trim() ?? "")) return null;
+  const cwdIdx = lines.findIndex((l, i) => i > 0 && /^cwd:\s*/i.test(l.trim()));
   const commandLines = lines
-    .slice(1, cwdIndex === -1 ? undefined : cwdIndex)
-    .map((line) => line.trimEnd())
-    .filter((line) => line.trim().length > 0);
-
-  if (commandLines.length === 0) {
-    return null;
-  }
-
-  const cwd = cwdIndex === -1 ? null : (lines[cwdIndex]?.trim().replace(/^cwd:\s*/i, '').trim() || null);
-
-  return {
-    step: Number(headerMatch[1]),
-    command: commandLines.join('\n'),
-    cwd
-  };
+    .slice(1, cwdIdx === -1 ? undefined : cwdIdx)
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim());
+  if (commandLines.length === 0) return null;
+  const cwd =
+    cwdIdx === -1
+      ? null
+      : lines[cwdIdx]
+          ?.trim()
+          .replace(/^cwd:\s*/i, "")
+          .trim() || null;
+  return { command: commandLines.join("\n"), cwd };
 };
 
 const parseResult = (
-  text: string
-): { exit: string | null; timedOut: boolean; stdout: string | null; stderr: string | null } | null => {
-  const firstLine = text.split(/\r?\n/, 1)[0]?.trim() ?? '';
-  if (!/^exit:\s*/i.test(firstLine)) {
-    return null;
-  }
-
-  const exit = firstLine.replace(/^exit:\s*/i, '').trim() || null;
-  const stdout = text.match(/(?:^|\n)stdout:\n([\s\S]*?)(?=\n(?:stderr:|$))/i)?.[1]?.trim() ?? null;
-  const stderr = text.match(/(?:^|\n)stderr:\n([\s\S]*)$/i)?.[1]?.trim() ?? null;
-
-  return {
-    exit,
-    timedOut: /\(timeout\)/i.test(firstLine),
-    stdout,
-    stderr
-  };
+  text: string,
+): {
+  exit: string | null;
+  timedOut: boolean;
+  stdout: string | null;
+  stderr: string | null;
+} | null => {
+  const firstLine = text.split(/\r?\n/, 1)[0]?.trim() ?? "";
+  if (!/^exit:\s*/i.test(firstLine)) return null;
+  const exit = firstLine.replace(/^exit:\s*/i, "").trim() || null;
+  const stdout =
+    text
+      .match(/(?:^|\n)stdout:\n([\s\S]*?)(?=\n(?:stderr:|$))/i)?.[1]
+      ?.trim() ?? null;
+  const stderr =
+    text.match(/(?:^|\n)stderr:\n([\s\S]*)$/i)?.[1]?.trim() ?? null;
+  return { exit, timedOut: /\(timeout\)/i.test(firstLine), stdout, stderr };
 };
 
-const parseTrace = (trace: MessageStreamTrace): ParsedTrace => {
+const summarizeAction = (trace: MessageStreamTrace): ActionSummary => {
   const text = trace.text.trim();
-  const fileLocations = extractFileLocations(text);
-  const changeSummary = extractChangeSummary(text);
+  const kind = trace.actionKind;
 
   const checklist = parseChecklist(text);
-  if (checklist) {
-    return {
-      kind: 'checklist',
-      items: checklist,
-      fileLocations,
-      changeSummary
-    };
+  if (checklist) return { type: 'checklist', items: checklist };
+
+  if (kind === 'file-edit' || kind === 'file-create' || kind === 'file-delete') {
+    const patchEdits = parseFileEdits(text);
+    if (patchEdits) return { type: 'edited', files: patchEdits, raw: text };
+    const files = extractFileLocations(text);
+    const verb = kind === 'file-create' ? 'add' : kind === 'file-delete' ? 'delete' : 'update';
+    if (files.length > 0) {
+      return { type: 'edited', files: files.map((f) => ({ path: f, verb, added: 0, removed: 0 })), raw: text };
+    }
+    return { type: 'edited', files: [{ path: text.split('\n')[0] ?? 'file', verb, added: 0, removed: 0 }], raw: text };
+  }
+
+  if (kind === 'file-read') {
+    const files = extractFileLocations(text);
+    return { type: 'explored', count: files.length || 1, detail: text, raw: text };
+  }
+
+  if (kind === 'search') {
+    const searchLines = text.split(/\r?\n/).filter((l) => /search|grep|rg\s|find\s|Searched|list/i.test(l));
+    return { type: 'explored', count: Math.max(searchLines.length, 1), detail: text, raw: text };
+  }
+
+  if (kind === 'command') {
+    const parsed = parseCommand(text);
+    if (parsed) return { type: 'command', command: parsed.command, cwd: parsed.cwd, raw: text };
+    const firstLine = text.split('\n')[0] ?? text;
+    return { type: 'command', command: firstLine, cwd: null, raw: text };
+  }
+
+  if (kind === 'command-result') {
+    const parsed = parseResult(text);
+    if (parsed) return { type: 'result', exit: parsed.exit, timedOut: parsed.timedOut, stdout: parsed.stdout, stderr: parsed.stderr };
+    return { type: 'result', exit: null, timedOut: false, stdout: text, stderr: null };
   }
 
   const command = parseCommand(text);
-  if (command) {
-    return {
-      kind: 'command',
-      step: command.step,
-      command: command.command,
-      cwd: command.cwd,
-      fileLocations,
-      changeSummary
-    };
-  }
+  if (command) return { type: 'command', command: command.command, cwd: command.cwd, raw: text };
 
   const result = parseResult(text);
-  if (result) {
-    return {
-      kind: 'result',
-      exit: result.exit,
-      timedOut: result.timedOut,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      fileLocations,
-      changeSummary
-    };
+  if (result) return { type: 'result', exit: result.exit, timedOut: result.timedOut, stdout: result.stdout, stderr: result.stderr };
+
+  const fileEdits = parseFileEdits(text);
+  if (fileEdits) return { type: 'edited', files: fileEdits, raw: text };
+
+  if (SEARCH_PATTERN.test(text)) {
+    const searchLines = text.split(/\r?\n/).filter((l) => /search|grep|rg\s|find\s|Searched/i.test(l));
+    return { type: 'explored', count: Math.max(searchLines.length, 1), detail: text, raw: text };
   }
 
-  return {
-    kind: 'note',
-    text,
-    fileLocations,
-    changeSummary
-  };
+  return { type: 'text', content: text, files: extractFileLocations(text) };
 };
 
-const roleLabel = (role: Message['role']): string => {
-  if (role === 'user') return 'You';
-  if (role === 'assistant') return 'Assistant';
-  if (role === 'tool') return 'Tool';
-  return 'System';
+const roleLabel = (role: Message["role"]): string => {
+  if (role === "user") return "You";
+  if (role === "assistant") return "Assistant";
+  if (role === "tool") return "Tool";
+  return "System";
+};
+
+type TimelineGroup =
+  | { kind: "action"; trace: MessageStreamTrace; text: string }
+  | { kind: "text"; content: string };
+
+const buildTimelineGroups = (
+  timeline: StreamTimelineEntry[],
+): { groups: TimelineGroup[]; currentThought: string | null } => {
+  const groups: TimelineGroup[] = [];
+  let currentThought: string | null = null;
+
+  for (const entry of timeline) {
+    if (entry.type === "trace") {
+      if (entry.trace.traceKind === "thought") {
+        currentThought = entry.trace.text.trim();
+      } else {
+        groups.push({ kind: "action", trace: entry.trace, text: "" });
+      }
+    } else {
+      const last = groups[groups.length - 1];
+      if (last && last.kind === "action" && !last.text) {
+        last.text = entry.content;
+      } else {
+        groups.push({ kind: "text", content: entry.content });
+      }
+    }
+  }
+
+  return { groups, currentThought };
+};
+
+const basename = (filePath: string): string => {
+  const parts = filePath.split('/');
+  return parts[parts.length - 1] ?? filePath;
+};
+
+const BACKTICK_PATH = /`([^`]*(?:\/[^`]+|\.[a-z0-9]{1,10}))`/gi;
+
+const extractInlineFiles = (text: string): string[] => {
+  const matches: string[] = [];
+  for (const m of text.matchAll(BACKTICK_PATH)) {
+    const val = m[1]?.trim();
+    if (!val || /^https?:\/\//i.test(val) || val.includes(' ') || val.length > 120) continue;
+    matches.push(val);
+  }
+  return [...new Set(matches)].slice(0, 12);
 };
 
 export const MessageList = ({
@@ -274,241 +254,328 @@ export const MessageList = ({
   liveText,
   streaming,
   traces = [],
+  timeline = [],
   status,
-  statusTrail = []
+  statusTrail = [],
 }: MessageListProps) => {
   const bottomRef = useRef<HTMLDivElement>(null);
-  const statuses = useMemo(() => compactStatuses(statusTrail, status), [statusTrail, status]);
+  const { groups: timelineGroups, currentThought } = useMemo(
+    () => buildTimelineGroups(timeline),
+    [timeline],
+  );
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages.length, liveText, traces.length, statuses.length]);
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages.length, timelineGroups.length, currentThought]);
 
-  if (messages.length === 0 && !liveText && traces.length === 0 && statuses.length === 0) {
+  if (
+    messages.length === 0 &&
+    !liveText &&
+    traces.length === 0 &&
+    timeline.length === 0
+  ) {
     return (
       <div className="flex flex-1 items-center justify-center">
         <div className="rounded-2xl border border-border/60 bg-card/70 px-5 py-4 text-center backdrop-blur-sm">
-          <p className="font-display text-sm tracking-wide text-foreground/90">No messages yet</p>
-          <p className="mt-1 text-xs text-muted-foreground">Send a prompt to get started</p>
+          <p className="font-display text-sm tracking-wide text-foreground/90">
+            No messages yet
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Send a prompt to get started
+          </p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="scroll-soft relative flex-1 overflow-auto">
-      <div className="pointer-events-none absolute inset-0 [background-image:radial-gradient(circle_at_6%_6%,hsl(var(--primary)/0.18),transparent_45%),radial-gradient(circle_at_90%_10%,hsl(var(--accent)/0.12),transparent_36%),linear-gradient(180deg,hsl(var(--background)),hsl(var(--background)/0.88))]" />
-      <div className="pointer-events-none absolute inset-0 opacity-[0.06] [background-image:linear-gradient(to_right,hsl(var(--foreground))_1px,transparent_1px),linear-gradient(to_bottom,hsl(var(--foreground))_1px,transparent_1px)] [background-size:10px_10px]" />
+    <div className="scroll-soft relative flex-1 overflow-auto [background:radial-gradient(ellipse_at_0%_0%,hsl(var(--primary)/0.08),transparent_60%),radial-gradient(ellipse_at_100%_100%,hsl(var(--accent)/0.06),transparent_60%)] [background-attachment:fixed]">
       <div className="relative mx-auto max-w-4xl px-4 py-5">
-        <div className="grid gap-4">
-          {messages.map((message) => (
-            <article
-              key={message.id}
-              className={cn(
-                'group max-w-[90%] animate-rise rounded-2xl border px-4 py-3 shadow-[0_14px_45px_hsl(var(--shadow)/0.25)]',
-                message.role === 'user'
-                  ? 'ml-auto border-primary/[0.35] bg-primary/10'
-                  : 'mr-auto border-border/60 bg-card/[0.65] backdrop-blur-sm'
-              )}
-            >
-              <div className="mb-2 flex items-center gap-2">
-                <span
-                  className={cn(
-                    'font-display text-[10px] uppercase tracking-[0.2em]',
-                    message.role === 'user' ? 'text-primary/90' : 'text-foreground/[0.55]'
-                  )}
-                >
-                  {roleLabel(message.role)}
-                </span>
-              </div>
-              <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90">{message.content}</p>
-            </article>
-          ))}
-
-          {(statuses.length > 0 || streaming) && (
-            <section className="relative overflow-hidden rounded-2xl border border-border/60 bg-card/[0.65] p-4 shadow-[0_14px_45px_hsl(var(--shadow)/0.2)] backdrop-blur-sm">
-              <div className="pointer-events-none absolute inset-0 [background-image:linear-gradient(130deg,hsl(var(--primary)/0.14),transparent_60%)]" />
-              <div className="relative">
-                <div className="mb-3 flex items-center gap-2">
-                  <Loader2 className={cn('h-3.5 w-3.5 text-primary', streaming && 'animate-spin')} />
-                  <span className="font-display text-[10px] uppercase tracking-[0.2em] text-foreground/[0.55]">
-                    Live Activity
-                  </span>
-                </div>
-                <ol className="grid gap-1.5">
-                  {statuses.map((entry, index) => (
-                    <li key={`${entry}-${index}`} className="flex items-start gap-2 rounded-lg border border-border/40 bg-background/[0.35] px-2.5 py-2">
-                      <span
-                        className={cn(
-                          'mt-1 h-1.5 w-1.5 rounded-full bg-primary/80',
-                          streaming && index === statuses.length - 1 && 'animate-pulse'
-                        )}
-                      />
-                      <span className="text-[12px] leading-relaxed text-foreground/[0.85]">{entry}</span>
-                    </li>
-                  ))}
-                  {statuses.length === 0 && streaming && (
-                    <li className="rounded-lg border border-border/40 bg-background/[0.35] px-2.5 py-2 text-[12px] text-foreground/80">
-                      Loading execution events...
-                    </li>
-                  )}
-                </ol>
-              </div>
-            </section>
-          )}
-
-          {traces.map((trace, index) => {
-            const parsed = parseTrace(trace);
-            const meta = TRACE_META[trace.traceKind];
-            const Icon = meta.icon;
-
-            return (
+        <div className="grid gap-3">
+          {messages
+            .filter((message) => message.role !== "assistant")
+            .map((message) => (
               <article
-                key={`${trace.traceKind}-${index}`}
+                key={message.id}
                 className={cn(
-                  'animate-rise rounded-2xl border p-4 shadow-[0_14px_45px_hsl(var(--shadow)/0.22)] backdrop-blur-sm',
-                  meta.cardClass
+                  "group max-w-[90%] animate-rise rounded-2xl border px-4 py-3 shadow-[0_14px_45px_hsl(var(--shadow)/0.25)]",
+                  message.role === "user"
+                    ? "ml-auto border-primary/[0.35] bg-primary/10"
+                    : "mr-auto border-border/60 bg-card/[0.65] backdrop-blur-sm",
                 )}
-                style={{ animationDelay: `${index * 70}ms` }}
               >
-                <div className="mb-3 flex items-center gap-2">
-                  <Icon className={cn('h-3.5 w-3.5', meta.accentClass)} />
-                  <span className={cn('font-display text-[10px] uppercase tracking-[0.2em]', meta.accentClass)}>
-                    {meta.label}
+                <div className="mb-2 flex items-center gap-2">
+                  <span
+                    className={cn(
+                      "font-display text-[10px] uppercase tracking-[0.2em]",
+                      message.role === "user"
+                        ? "text-primary/90"
+                        : "text-foreground/[0.55]",
+                    )}
+                  >
+                    {roleLabel(message.role)}
                   </span>
-                  <span className="ml-auto text-[10px] text-foreground/[0.45]">#{index + 1}</span>
                 </div>
+                <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90">
+                  {message.content}
+                </p>
+              </article>
+            ))}
 
-                {parsed.kind === 'checklist' && (
-                  <ul className="grid gap-2">
-                    {parsed.items.map((item) => (
-                      <li
-                        key={`${item.index}-${item.text}`}
-                        className={cn(
-                          'flex items-start gap-2 rounded-lg border px-2.5 py-2 text-[12px]',
-                          item.done ? 'border-emerald-300/[0.35] bg-emerald-300/10' : 'border-border/50 bg-background/[0.35]'
-                        )}
-                      >
-                        {item.done ? (
-                          <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 text-emerald-300" />
-                        ) : (
-                          <Circle className="mt-0.5 h-3.5 w-3.5 text-foreground/[0.45]" />
-                        )}
-                        <span className="leading-relaxed text-foreground/[0.85]">
-                          {item.index}. {item.text}
+          {timelineGroups.map((group, index) => {
+            if (group.kind === 'text') {
+              const inlineFiles = extractInlineFiles(group.content);
+              return (
+                <div key={`tl-${index}`} className="animate-rise grid gap-1.5">
+                  <p className="whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/75">
+                    {group.content}
+                  </p>
+                  {inlineFiles.length > 0 && (
+                    <details className="group/det rounded-lg border border-border/40 bg-card/40">
+                      <summary className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-[12px]">
+                        <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
+                        <Search className="h-3 w-3 text-sky-400/70" />
+                        <span className="text-foreground/70">
+                          Explored {inlineFiles.length} file{inlineFiles.length !== 1 ? 's' : ''}
                         </span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-
-                {parsed.kind === 'command' && (
-                  <div className="grid gap-2">
-                    <div className="rounded-lg border border-border/50 bg-black/[0.35] px-2.5 py-2.5">
-                      <pre className="overflow-x-auto whitespace-pre-wrap text-[12px] leading-relaxed text-emerald-200">
-                        <code>{parsed.command}</code>
-                      </pre>
-                    </div>
-                    {parsed.cwd && (
-                      <div className="rounded-lg border border-border/50 bg-background/[0.35] px-2.5 py-2 text-[11px] text-foreground/70">
-                        cwd: <span className="font-mono text-[11px] text-foreground/[0.85]">{parsed.cwd}</span>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {parsed.kind === 'result' && (
-                  <div className="grid gap-2">
-                    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/50 bg-background/[0.35] px-2.5 py-2">
-                      <span className="font-display text-[10px] uppercase tracking-[0.15em] text-foreground/[0.55]">
-                        Exit
-                      </span>
-                      <span
-                        className={cn(
-                          'rounded-md border px-2 py-0.5 font-mono text-[11px]',
-                          parsed.exit === '0'
-                            ? 'border-emerald-300/[0.35] bg-emerald-300/10 text-emerald-200'
-                            : 'border-rose-300/[0.35] bg-rose-300/10 text-rose-200'
-                        )}
-                      >
-                        {parsed.exit ?? 'n/a'}
-                      </span>
-                      {parsed.timedOut && (
-                        <span className="rounded-md border border-amber-300/[0.35] bg-amber-300/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.15em] text-amber-200">
-                          timeout
-                        </span>
-                      )}
-                    </div>
-                    {parsed.stdout && (
-                      <details className="rounded-lg border border-border/50 bg-background/[0.35] px-2.5 py-2">
-                        <summary className="cursor-pointer font-display text-[10px] uppercase tracking-[0.15em] text-foreground/60">
-                          stdout
-                        </summary>
-                        <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-[11px] leading-relaxed text-foreground/[0.85]">
-                          <code>{parsed.stdout}</code>
-                        </pre>
-                      </details>
-                    )}
-                    {parsed.stderr && (
-                      <details className="rounded-lg border border-border/50 bg-background/[0.35] px-2.5 py-2">
-                        <summary className="cursor-pointer font-display text-[10px] uppercase tracking-[0.15em] text-foreground/60">
-                          stderr
-                        </summary>
-                        <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-[11px] leading-relaxed text-rose-200/90">
-                          <code>{parsed.stderr}</code>
-                        </pre>
-                      </details>
-                    )}
-                  </div>
-                )}
-
-                {parsed.kind === 'note' && (
-                  <p className="whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/[0.88]">{parsed.text}</p>
-                )}
-
-                {(parsed.changeSummary || parsed.fileLocations.length > 0) && (
-                  <div className="mt-3 grid gap-2">
-                    {parsed.changeSummary && (
-                      <div className="inline-flex w-fit items-center gap-1 rounded-md border border-primary/30 bg-primary/10 px-2 py-1 text-[10px] uppercase tracking-[0.15em] text-primary-foreground/[0.85]">
-                        <FileCode2 className="h-3 w-3" />
-                        <span>{parsed.changeSummary}</span>
-                      </div>
-                    )}
-                    {parsed.fileLocations.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5">
-                        {parsed.fileLocations.map((location) => (
+                      </summary>
+                      <div className="flex flex-wrap gap-1.5 border-t border-border/30 px-3 py-2">
+                        {inlineFiles.map((f) => (
                           <span
-                            key={location}
-                            className="rounded-md border border-border/50 bg-background/[0.35] px-2 py-1 font-mono text-[10px] text-foreground/75"
+                            key={f}
+                            className="inline-flex items-center gap-1 rounded-md border border-border/40 bg-card/50 px-1.5 py-0.5 font-mono text-[10px] text-foreground/55"
                           >
-                            {location}
+                            <FileCode2 className="h-2.5 w-2.5" />
+                            {f}
                           </span>
                         ))}
                       </div>
+                    </details>
+                  )}
+                </div>
+              );
+            }
+
+            const summary = summarizeAction(group.trace);
+
+            if (summary.type === "edited") {
+              return (
+                <div key={`tl-${index}`} className="animate-rise grid gap-1">
+                  {group.text && (
+                    <p className="text-[12px] leading-relaxed text-foreground/75">
+                      {group.text}
+                    </p>
+                  )}
+                  {summary.files.map((file) => (
+                    <details
+                      key={file.path}
+                      className="group/det rounded-lg border border-border/40 bg-card/40"
+                    >
+                      <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px]">
+                        <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
+                        <FilePenLine className="h-3 w-3 text-foreground/50" />
+                        <span className="font-medium text-foreground/80">
+                          {file.verb === "add"
+                            ? "Created"
+                            : file.verb === "delete"
+                              ? "Deleted"
+                              : "Edited"}{" "}
+                          {basename(file.path)}
+                        </span>
+                        {(file.added > 0 || file.removed > 0) && (
+                          <span className="ml-auto flex gap-1.5 font-mono text-[10px]">
+                            {file.added > 0 && (
+                              <span className="text-emerald-400">
+                                +{file.added}
+                              </span>
+                            )}
+                            {file.removed > 0 && (
+                              <span className="text-rose-400">
+                                -{file.removed}
+                              </span>
+                            )}
+                          </span>
+                        )}
+                      </summary>
+                      <div className="border-t border-border/30 px-3 py-2">
+                        <span className="font-mono text-[10px] text-foreground/50">
+                          {file.path}
+                        </span>
+                      </div>
+                    </details>
+                  ))}
+                </div>
+              );
+            }
+
+            if (summary.type === "command") {
+              return (
+                <div key={`tl-${index}`} className="animate-rise grid gap-1">
+                  {group.text && (
+                    <p className="text-[12px] leading-relaxed text-foreground/75">
+                      {group.text}
+                    </p>
+                  )}
+                  <details className="group/det rounded-lg border border-border/40 bg-card/40">
+                    <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px]">
+                      <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
+                      <TerminalSquare className="h-3 w-3 text-emerald-400/70" />
+                      <span className="truncate font-mono text-foreground/70">
+                        {summary.command.split("\n")[0]}
+                      </span>
+                    </summary>
+                    <div className="border-t border-border/30 bg-black/20 px-3 py-2">
+                      <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-emerald-200/80">
+                        <code>{summary.command}</code>
+                      </pre>
+                      {summary.cwd && (
+                        <p className="mt-1.5 font-mono text-[10px] text-foreground/40">
+                          cwd: {summary.cwd}
+                        </p>
+                      )}
+                    </div>
+                  </details>
+                </div>
+              );
+            }
+
+            if (summary.type === "result") {
+              return (
+                <div
+                  key={`tl-${index}`}
+                  className="animate-rise flex items-center gap-2"
+                >
+                  <span
+                    className={cn(
+                      "rounded-md border px-1.5 py-0.5 font-mono text-[10px]",
+                      summary.exit === "0"
+                        ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300"
+                        : "border-rose-400/30 bg-rose-400/10 text-rose-300",
                     )}
+                  >
+                    exit {summary.exit ?? "?"}
+                  </span>
+                  {summary.timedOut && (
+                    <span className="rounded-md border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-300">
+                      timeout
+                    </span>
+                  )}
+                  {summary.stdout && (
+                    <details className="min-w-0 flex-1">
+                      <summary className="cursor-pointer text-[10px] text-foreground/40 hover:text-foreground/60">
+                        stdout
+                      </summary>
+                      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded-lg border border-border/30 bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-foreground/70">
+                        <code>{summary.stdout}</code>
+                      </pre>
+                    </details>
+                  )}
+                  {summary.stderr && (
+                    <details className="min-w-0 flex-1">
+                      <summary className="cursor-pointer text-[10px] text-foreground/40 hover:text-foreground/60">
+                        stderr
+                      </summary>
+                      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded-lg border border-border/30 bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200/70">
+                        <code>{summary.stderr}</code>
+                      </pre>
+                    </details>
+                  )}
+                </div>
+              );
+            }
+
+            if (summary.type === "explored") {
+              return (
+                <div key={`tl-${index}`} className="animate-rise grid gap-1">
+                  {group.text && (
+                    <p className="text-[12px] leading-relaxed text-foreground/75">
+                      {group.text}
+                    </p>
+                  )}
+                  <details className="group/det rounded-lg border border-border/40 bg-card/40">
+                    <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px]">
+                      <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
+                      <Search className="h-3 w-3 text-sky-400/70" />
+                      <span className="text-foreground/70">
+                        Explored {summary.count} search
+                        {summary.count !== 1 ? "es" : ""}
+                      </span>
+                    </summary>
+                    <div className="border-t border-border/30 px-3 py-2">
+                      <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-foreground/50">
+                        {summary.detail}
+                      </pre>
+                    </div>
+                  </details>
+                </div>
+              );
+            }
+
+            if (summary.type === "checklist") {
+              return (
+                <ul key={`tl-${index}`} className="animate-rise grid gap-1">
+                  {summary.items.map((item) => (
+                    <li
+                      key={`${item.index}-${item.text}`}
+                      className="flex items-start gap-2 text-[12px]"
+                    >
+                      {item.done ? (
+                        <CheckCircle2 className="mt-0.5 h-3 w-3 text-emerald-400" />
+                      ) : (
+                        <Circle className="mt-0.5 h-3 w-3 text-foreground/25" />
+                      )}
+                      <span
+                        className={cn(
+                          "leading-relaxed",
+                          item.done
+                            ? "text-foreground/60"
+                            : "text-foreground/80",
+                        )}
+                      >
+                        {item.text}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              );
+            }
+
+            return (
+              <div key={`tl-${index}`} className="animate-rise grid gap-1">
+                {group.text && (
+                  <p className="text-[12px] leading-relaxed text-foreground/75">
+                    {group.text}
+                  </p>
+                )}
+                {summary.content && !group.text && (
+                  <p className="text-[12px] leading-relaxed text-foreground/75">
+                    {summary.content}
+                  </p>
+                )}
+                {summary.files.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {summary.files.map((loc) => (
+                      <span
+                        key={loc}
+                        className="inline-flex items-center gap-1 rounded-md border border-border/40 bg-card/40 px-1.5 py-0.5 font-mono text-[10px] text-foreground/55"
+                      >
+                        <FileCode2 className="h-2.5 w-2.5" />
+                        {basename(loc)}
+                      </span>
+                    ))}
                   </div>
                 )}
-              </article>
+              </div>
             );
           })}
 
-          {(liveText || streaming) && (
-            <article className="relative overflow-hidden rounded-2xl border border-primary/[0.35] bg-primary/10 p-4 shadow-[0_14px_45px_hsl(var(--shadow)/0.22)]">
-              <div className="pointer-events-none absolute inset-0 [background-image:linear-gradient(140deg,hsl(var(--primary)/0.2),transparent_60%)]" />
-              <div className="relative">
-                <div className="mb-2 flex items-center gap-2">
-                  <Sparkles className={cn('h-3.5 w-3.5 text-primary', streaming && 'animate-pulse')} />
-                  <span className="font-display text-[10px] uppercase tracking-[0.2em] text-primary/[0.85]">
-                    Assistant Draft
-                  </span>
-                </div>
-                {liveText ? (
-                  <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90">{liveText}</p>
-                ) : (
-                  <p className="text-[12px] text-foreground/[0.65]">Preparing response...</p>
-                )}
-              </div>
-            </article>
+          {streaming && (
+            <div className="flex items-center gap-2 py-1">
+              <Loader2 className="h-3 w-3 animate-spin text-foreground/40" />
+              <span className="text-[11px] text-foreground/50">
+                {currentThought ?? status ?? "Thinking..."}
+              </span>
+            </div>
           )}
 
           <div ref={bottomRef} />

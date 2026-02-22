@@ -1,4 +1,5 @@
 import type { Message, MessageAccessMode, MessageStreamTrace, ModelProfile, Session, Workspace } from '../../../preload/types';
+import type { StreamTimelineEntry } from './chat.store';
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Composer } from './Composer';
@@ -24,6 +25,7 @@ type ChatViewProps = {
     active: boolean;
     text: string;
     traces: MessageStreamTrace[];
+    timeline: StreamTimelineEntry[];
     status: string | null;
     statusTrail: string[];
   };
@@ -79,6 +81,7 @@ export const ChatView = ({
       <MessageList
         messages={messages}
         traces={stream.traces}
+        timeline={stream.timeline}
         liveText={stream.text}
         streaming={stream.active}
         status={stream.status}

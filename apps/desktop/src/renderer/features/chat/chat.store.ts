@@ -13,12 +13,17 @@ import type {
 } from '../../../preload/types';
 import { api } from '../../shared/api/client';
 
+export type StreamTimelineEntry =
+  | { type: 'trace'; trace: MessageStreamTrace }
+  | { type: 'text'; content: string };
+
 type StreamingState = {
   active: boolean;
   streamId: string | null;
   sessionId: string | null;
   text: string;
   traces: MessageStreamTrace[];
+  timeline: StreamTimelineEntry[];
   status: string | null;
   statusTrail: string[];
 };
@@ -175,19 +180,31 @@ const ensureStreamListener = (
         },
         streaming: {
           ...current.streaming,
-          traces: [...(current.sessionTracesById[event.sessionId] ?? []), trace]
+          traces: [...(current.sessionTracesById[event.sessionId] ?? []), trace],
+          timeline: [...current.streaming.timeline, { type: 'trace', trace }]
         }
       }));
       return;
     }
 
     if (event.type === 'text_delta' && event.text) {
-      set((current) => ({
-        streaming: {
-          ...current.streaming,
-          text: `${current.streaming.text}${event.text}`
+      const delta = event.text;
+      set((current) => {
+        const timeline = [...current.streaming.timeline];
+        const last = timeline[timeline.length - 1];
+        if (last && last.type === 'text') {
+          timeline[timeline.length - 1] = { type: 'text', content: last.content + delta };
+        } else {
+          timeline.push({ type: 'text', content: delta });
         }
-      }));
+        return {
+          streaming: {
+            ...current.streaming,
+            text: `${current.streaming.text}${delta}`,
+            timeline
+          }
+        };
+      });
       return;
     }
 
@@ -258,6 +275,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     sessionId: null,
     text: '',
     traces: [],
+    timeline: [],
     status: null,
     statusTrail: []
   },
@@ -432,6 +450,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         sessionId: activeSessionId,
         text: '',
         traces: [],
+        timeline: [],
         status: 'Starting...',
         statusTrail: ['Starting...']
       }

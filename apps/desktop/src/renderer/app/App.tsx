@@ -33,6 +33,7 @@ export const App = () => {
           active: false,
           text: '',
           traces: selectedSessionTraces,
+          timeline: [],
           status: selectedSessionStatuses[selectedSessionStatuses.length - 1] ?? null,
           statusTrail: selectedSessionStatuses
         };

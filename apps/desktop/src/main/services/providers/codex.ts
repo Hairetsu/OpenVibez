@@ -9,9 +9,11 @@ type DeviceAuthStatus = 'idle' | 'pending' | 'success' | 'error';
 
 type TraceKind = 'thought' | 'plan' | 'action';
 
+type ActionKind = 'file-edit' | 'file-read' | 'file-create' | 'file-delete' | 'search' | 'command' | 'command-result' | 'generic';
+
 type CodexStreamEvent =
   | { type: 'status'; text: string }
-  | { type: 'trace'; traceKind: TraceKind; text: string }
+  | { type: 'trace'; traceKind: TraceKind; text: string; actionKind?: ActionKind }
   | { type: 'assistant_delta'; delta: string };
 
 export type CodexDeviceAuthState = {
@@ -119,6 +121,41 @@ const classifyReasoning = (text: string): TraceKind => {
   return 'thought';
 };
 
+const classifyAction = (itemType: string, itemName: string, text: string): ActionKind => {
+  const combo = `${itemType} ${itemName}`.toLowerCase();
+
+  if (/write|patch|edit|update|apply/i.test(combo) || /\*\*\*\s+Update\s+File:/i.test(text)) {
+    return 'file-edit';
+  }
+  if (/create|add|mkdir/i.test(combo) || /\*\*\*\s+Add\s+File:/i.test(text)) {
+    return 'file-create';
+  }
+  if (/delete|remove|rm\b/i.test(combo) || /\*\*\*\s+Delete\s+File:/i.test(text)) {
+    return 'file-delete';
+  }
+  if (/read|cat|head|tail|view/i.test(combo)) {
+    return 'file-read';
+  }
+  if (/search|grep|rg\b|find|glob|list_dir|ls\b/i.test(combo)) {
+    return 'search';
+  }
+  if (/shell|exec|command|bash|run|terminal/i.test(combo)) {
+    return 'command';
+  }
+  if (/output|result/i.test(itemType)) {
+    return 'command-result';
+  }
+
+  if (/^exit:\s*/i.test(text.split('\n', 1)[0] ?? '')) {
+    return 'command-result';
+  }
+  if (/^Step\s+\d+\s+command:/i.test(text.split('\n', 1)[0] ?? '')) {
+    return 'command';
+  }
+
+  return 'generic';
+};
+
 const extractItemText = (item: Record<string, unknown>): string => {
   const raw = item.text;
   if (typeof raw === 'string' && raw.trim()) {
@@ -128,6 +165,38 @@ const extractItemText = (item: Record<string, unknown>): string => {
   const alt = item.message;
   if (typeof alt === 'string' && alt.trim()) {
     return alt;
+  }
+
+  const output = item.output;
+  if (typeof output === 'string' && output.trim()) {
+    return output;
+  }
+
+  const name = typeof item.name === 'string' ? item.name : '';
+  const args = item.arguments;
+  if (name && typeof args === 'string') {
+    try {
+      const parsed = JSON.parse(args) as Record<string, unknown>;
+      const filePath = parsed.path ?? parsed.file ?? parsed.filename;
+      if (typeof filePath === 'string') {
+        return `${name}: ${filePath}`;
+      }
+      const cmd = parsed.command ?? parsed.cmd;
+      if (typeof cmd === 'string') {
+        return `${name}: ${cmd}`;
+      }
+      const query = parsed.query ?? parsed.pattern ?? parsed.search;
+      if (typeof query === 'string') {
+        return `${name}: ${query}`;
+      }
+      return `${name}: ${args}`;
+    } catch {
+      return `${name}: ${args}`;
+    }
+  }
+
+  if (name) {
+    return name;
   }
 
   return '';
@@ -459,8 +528,9 @@ export const createCodexCompletion = async (input: CodexCompletionInput): Promis
       }
 
       const itemType = typeof parsed.item.type === 'string' ? parsed.item.type : '';
+      const itemName = typeof parsed.item.name === 'string' ? parsed.item.name : '';
       const text = extractItemText(parsed.item);
-      if (!text) {
+      if (!text && !itemName && !itemType) {
         return;
       }
 
@@ -479,10 +549,12 @@ export const createCodexCompletion = async (input: CodexCompletionInput): Promis
         return;
       }
 
+      const traceText = text || `${itemName || itemType}`;
       input.onEvent?.({
         type: 'trace',
         traceKind: 'action',
-        text
+        text: traceText,
+        actionKind: classifyAction(itemType, itemName, traceText)
       });
     };
 

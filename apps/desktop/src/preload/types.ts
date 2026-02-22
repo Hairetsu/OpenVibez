@@ -21,9 +21,12 @@ export type ProviderSubscriptionLoginState = {
 
 export type MessageAccessMode = 'scoped' | 'root';
 
+export type ActionKind = 'file-edit' | 'file-read' | 'file-create' | 'file-delete' | 'search' | 'command' | 'command-result' | 'generic';
+
 export type MessageStreamTrace = {
   traceKind: 'thought' | 'plan' | 'action';
   text: string;
+  actionKind?: ActionKind;
 };
 
 export type MessageStreamEvent = {
