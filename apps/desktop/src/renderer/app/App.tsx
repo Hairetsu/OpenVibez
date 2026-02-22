@@ -22,6 +22,20 @@ export const App = () => {
   );
 
   const visibleSessions = store.sessions.filter((session) => session.workspaceId === store.selectedWorkspaceId);
+  const selectedSessionTraces = store.selectedSessionId ? (store.sessionTracesById[store.selectedSessionId] ?? []) : [];
+  const selectedSessionStatuses = store.selectedSessionId
+    ? (store.sessionStatusesById[store.selectedSessionId] ?? [])
+    : [];
+  const visibleStream =
+    store.selectedSessionId && store.streaming.sessionId === store.selectedSessionId
+      ? store.streaming
+      : {
+          active: false,
+          text: '',
+          traces: selectedSessionTraces,
+          status: selectedSessionStatuses[selectedSessionStatuses.length - 1] ?? null,
+          statusTrail: selectedSessionStatuses
+        };
 
   return (
     <div className="flex h-screen flex-col overflow-hidden">
@@ -90,7 +104,7 @@ export const App = () => {
               workspaces={store.workspaces}
               selectedWorkspaceId={store.selectedWorkspaceId}
               onWorkspaceChange={store.setSelectedWorkspaceId}
-              stream={store.streaming}
+              stream={visibleStream}
             />
           ) : (
             <div className="scroll-soft flex-1 overflow-auto p-4">

@@ -25,6 +25,7 @@ type ChatViewProps = {
     text: string;
     traces: MessageStreamTrace[];
     status: string | null;
+    statusTrail: string[];
   };
 };
 
@@ -75,7 +76,14 @@ export const ChatView = ({
         )}
       </div>
 
-      <MessageList messages={messages} traces={stream.traces} liveText={stream.text} streaming={stream.active} />
+      <MessageList
+        messages={messages}
+        traces={stream.traces}
+        liveText={stream.text}
+        streaming={stream.active}
+        status={stream.status}
+        statusTrail={stream.statusTrail}
+      />
       <Composer onSend={onSend} onCancel={onCancel} streaming={stream.active} />
     </div>
   );

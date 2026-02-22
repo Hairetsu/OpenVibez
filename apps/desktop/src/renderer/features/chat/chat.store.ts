@@ -16,9 +16,11 @@ import { api } from '../../shared/api/client';
 type StreamingState = {
   active: boolean;
   streamId: string | null;
+  sessionId: string | null;
   text: string;
   traces: MessageStreamTrace[];
   status: string | null;
+  statusTrail: string[];
 };
 
 type ChatState = {
@@ -35,6 +37,8 @@ type ChatState = {
   selectedModelId: string;
   accessMode: MessageAccessMode;
   usageSummary: { inputTokens: number; outputTokens: number; costMicrounits: number } | null;
+  sessionTracesById: Record<string, MessageStreamTrace[]>;
+  sessionStatusesById: Record<string, string[]>;
   streaming: StreamingState;
   initialize: () => Promise<void>;
   createProvider: (input: { displayName: string; authKind: Provider['authKind']; type?: Provider['type'] }) => Promise<void>;
@@ -112,6 +116,19 @@ const loadModelsForProvider = async (providerId: string | null): Promise<ModelPr
   }
 };
 
+const appendStatus = (statuses: string[], nextStatus: string | null | undefined): string[] => {
+  const normalized = nextStatus?.trim();
+  if (!normalized) {
+    return statuses;
+  }
+
+  if (statuses[statuses.length - 1] === normalized) {
+    return statuses;
+  }
+
+  return [...statuses, normalized];
+};
+
 const ensureStreamListener = (
   set: (partial: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void,
   get: () => ChatState
@@ -122,26 +139,43 @@ const ensureStreamListener = (
 
   streamUnsubscribe = api.message.onStreamEvent((event: MessageStreamEvent) => {
     const state = get();
-    if (!state.streaming.streamId || state.streaming.streamId !== event.streamId) {
+    if (
+      !state.streaming.streamId ||
+      state.streaming.streamId !== event.streamId ||
+      state.streaming.sessionId !== event.sessionId
+    ) {
       return;
     }
 
     if (event.type === 'status') {
-      set((current) => ({
-        streaming: {
-          ...current.streaming,
-          status: event.text ?? current.streaming.status
-        }
-      }));
+      set((current) => {
+        const sessionStatuses = current.sessionStatusesById[event.sessionId] ?? [];
+        const nextStatuses = appendStatus(sessionStatuses, event.text ?? current.streaming.status);
+        return {
+          sessionStatusesById: {
+            ...current.sessionStatusesById,
+            [event.sessionId]: nextStatuses
+          },
+          streaming: {
+            ...current.streaming,
+            status: event.text ?? current.streaming.status,
+            statusTrail: nextStatuses
+          }
+        };
+      });
       return;
     }
 
     if (event.type === 'trace' && event.trace) {
       const trace = event.trace;
       set((current) => ({
+        sessionTracesById: {
+          ...current.sessionTracesById,
+          [event.sessionId]: [...(current.sessionTracesById[event.sessionId] ?? []), trace]
+        },
         streaming: {
           ...current.streaming,
-          traces: [...current.streaming.traces, trace]
+          traces: [...(current.sessionTracesById[event.sessionId] ?? []), trace]
         }
       }));
       return;
@@ -158,24 +192,44 @@ const ensureStreamListener = (
     }
 
     if (event.type === 'error') {
-      set((current) => ({
-        streaming: {
-          ...current.streaming,
-          active: false,
-          status: event.text ?? 'Provider error'
-        }
-      }));
+      set((current) => {
+        const nextStatus = event.text ?? 'Provider error';
+        const sessionStatuses = current.sessionStatusesById[event.sessionId] ?? [];
+        const nextStatuses = appendStatus(sessionStatuses, nextStatus);
+        return {
+          sessionStatusesById: {
+            ...current.sessionStatusesById,
+            [event.sessionId]: nextStatuses
+          },
+          streaming: {
+            ...current.streaming,
+            active: false,
+            status: nextStatus,
+            statusTrail: nextStatuses
+          }
+        };
+      });
       return;
     }
 
     if (event.type === 'done') {
-      set((current) => ({
-        streaming: {
-          ...current.streaming,
-          active: false,
-          status: current.streaming.status ?? 'Done'
-        }
-      }));
+      set((current) => {
+        const nextStatus = current.streaming.status ?? 'Done';
+        const sessionStatuses = current.sessionStatusesById[event.sessionId] ?? [];
+        const nextStatuses = appendStatus(sessionStatuses, nextStatus);
+        return {
+          sessionStatusesById: {
+            ...current.sessionStatusesById,
+            [event.sessionId]: nextStatuses
+          },
+          streaming: {
+            ...current.streaming,
+            active: false,
+            status: nextStatus,
+            statusTrail: nextStatuses
+          }
+        };
+      });
     }
   });
 };
@@ -196,12 +250,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
   selectedModelId: DEFAULT_MODEL_ID,
   accessMode: 'scoped',
   usageSummary: null,
+  sessionTracesById: {},
+  sessionStatusesById: {},
   streaming: {
     active: false,
     streamId: null,
+    sessionId: null,
     text: '',
     traces: [],
-    status: null
+    status: null,
+    statusTrail: []
   },
 
   initialize: async () => {
@@ -359,15 +417,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     const streamId = `stream_${nanoid(10)}`;
-    set({
+    set((state) => ({
+      sessionTracesById: {
+        ...state.sessionTracesById,
+        [activeSessionId]: []
+      },
+      sessionStatusesById: {
+        ...state.sessionStatusesById,
+        [activeSessionId]: ['Starting...']
+      },
       streaming: {
         active: true,
         streamId,
+        sessionId: activeSessionId,
         text: '',
         traces: [],
-        status: 'Starting...'
+        status: 'Starting...',
+        statusTrail: ['Starting...']
       }
-    });
+    }));
 
     const sent = await api.message.send({
       sessionId: activeSessionId,
@@ -384,9 +452,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const sessions = updatedSession
         ? [updatedSession, ...state.sessions.filter((session) => session.id !== updatedSession.id)]
         : state.sessions;
+      const keepCurrentMessages = state.selectedSessionId !== activeSessionId;
 
       return {
-        messages: [...state.messages, sent.userMessage, sent.assistantMessage],
+        messages: keepCurrentMessages ? state.messages : [...state.messages, sent.userMessage, sent.assistantMessage],
         sessions,
         streaming:
           state.streaming.streamId === streamId
@@ -410,9 +479,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     set((state) => ({
+      sessionStatusesById: state.streaming.sessionId
+        ? {
+            ...state.sessionStatusesById,
+            [state.streaming.sessionId]: appendStatus(
+              state.sessionStatusesById[state.streaming.sessionId] ?? [],
+              'Cancelling...'
+            )
+          }
+        : state.sessionStatusesById,
       streaming: {
         ...state.streaming,
-        status: 'Cancelling...'
+        status: 'Cancelling...',
+        statusTrail: appendStatus(state.streaming.statusTrail, 'Cancelling...')
       }
     }));
 
