@@ -30,6 +30,10 @@ export type RunnerContext = {
   history: RunnerHistoryMessage[];
   accessMode: 'scoped' | 'root';
   workspace?: WorkspaceRow;
+  codexOptions?: {
+    approvalPolicy?: 'untrusted' | 'on-failure' | 'on-request' | 'never';
+    outputSchemaJson?: string;
+  };
   signal: AbortSignal;
   onEvent?: (event: RunnerEvent) => void;
 };

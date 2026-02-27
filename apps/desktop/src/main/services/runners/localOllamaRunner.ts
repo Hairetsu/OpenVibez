@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import { createOllamaCompletion } from '../providers/ollama';
+import { createOllamaCompletion, createOllamaToolTurn } from '../providers/ollama';
 import { enforceCommandPolicy } from './commandPolicy';
 import { resolveOllamaModel } from './models';
 import type { ProviderRunner } from './types';
@@ -19,6 +19,13 @@ class RequestCancelledError extends Error {
   constructor(message = 'Request cancelled by user.') {
     super(message);
     this.name = 'AbortError';
+  }
+}
+
+class NativeToolFallbackError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NativeToolFallbackError';
   }
 }
 
@@ -374,7 +381,164 @@ const executeLocalToolCall = async (input: {
   };
 };
 
-export const runLocalOllama: ProviderRunner = async (input) => {
+const stringifyToolResult = (value: unknown): string => {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
+
+const runLocalOllamaNativeTools = async (input: Parameters<ProviderRunner>[0]): Promise<{
+  text: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}> => {
+  const model = resolveOllamaModel(input.modelProfileId, input.requestedModelId);
+  const workspacePath = input.workspace?.root_path;
+
+  const systemPrompt = [
+    'You are OpenVibez local coding assistant.',
+    'Use run_shell when shell access is needed to verify or compute results.',
+    'When tool calls are not needed, provide a concise direct answer.',
+    `Access mode: ${input.accessMode}.`,
+    `Workspace trust: ${input.workspace?.trust_level ?? 'none'}.`,
+    workspacePath ? `Preferred working directory: ${workspacePath}` : 'No workspace directory is selected.'
+  ].join('\n');
+
+  const tools = [
+    {
+      type: 'function' as const,
+      function: {
+        name: 'run_shell',
+        description: 'Execute a shell command and return stdout, stderr, and exit code.',
+        parameters: {
+          type: 'object',
+          properties: {
+            command: { type: 'string', description: 'Shell command to execute.' },
+            cwd: { type: 'string', description: 'Optional working directory.' }
+          },
+          required: ['command']
+        }
+      }
+    }
+  ];
+
+  const nativeHistory: Array<{
+    role: 'system' | 'user' | 'assistant' | 'tool';
+    content: string;
+    toolCalls?: Array<{ type: 'function'; function: { name: string; arguments: Record<string, unknown> } }>;
+  }> = [{ role: 'system', content: systemPrompt }, ...input.history.map((msg) => ({ role: msg.role, content: msg.content }))];
+
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let sawToolCall = false;
+
+  for (let step = 0; step < MAX_LOCAL_TOOL_STEPS; step += 1) {
+    throwIfAborted(input.signal);
+    input.onEvent?.({ type: 'status', text: step === 0 ? 'Planning...' : `Executing step ${step + 1}...` });
+
+    const turn = await createOllamaToolTurn({
+      baseUrl: input.secret ?? undefined,
+      model,
+      messages: nativeHistory,
+      tools,
+      signal: input.signal
+    });
+
+    totalInputTokens += turn.inputTokens ?? 0;
+    totalOutputTokens += turn.outputTokens ?? 0;
+
+    nativeHistory.push(turn.assistantMessage);
+
+    if (turn.toolCalls.length === 0) {
+      const text = turn.text.trim();
+      if (!text && !sawToolCall) {
+        throw new NativeToolFallbackError('Native tool mode produced no text and no tool calls.');
+      }
+      if (!text) {
+        throw new Error('Local model returned empty final response.');
+      }
+      input.onEvent?.({ type: 'assistant_delta', delta: `${text}\n` });
+      return {
+        text,
+        inputTokens: totalInputTokens > 0 ? totalInputTokens : undefined,
+        outputTokens: totalOutputTokens > 0 ? totalOutputTokens : undefined
+      };
+    }
+
+    sawToolCall = true;
+
+    for (const toolCall of turn.toolCalls) {
+      if (toolCall.function.name !== 'run_shell') {
+        throw new NativeToolFallbackError(`Unsupported native tool call: ${toolCall.function.name}`);
+      }
+
+      const command = typeof toolCall.function.arguments.command === 'string'
+        ? toolCall.function.arguments.command.trim()
+        : '';
+      const cwd = typeof toolCall.function.arguments.cwd === 'string'
+        ? toolCall.function.arguments.cwd.trim()
+        : undefined;
+
+      if (!command) {
+        throw new NativeToolFallbackError('run_shell tool call missing command.');
+      }
+
+      input.onEvent?.({
+        type: 'trace',
+        trace: {
+          traceKind: 'action',
+          text: `Command:\n${command}\ncwd: ${cwd ?? workspacePath ?? process.cwd()}`,
+          actionKind: 'command'
+        }
+      });
+      input.onEvent?.({ type: 'assistant_delta', delta: `$ ${command}\n` });
+
+      const toolResult = await executeLocalToolCall({
+        toolCall: {
+          name: 'run_shell',
+          arguments: { command, cwd }
+        },
+        workspacePath,
+        accessMode: input.accessMode,
+        workspace: input.workspace,
+        signal: input.signal
+      });
+
+      const traceResultLines = [
+        `exit: ${toolResult.exitCode ?? 'n/a'}${toolResult.timedOut ? ' (timeout)' : ''}`,
+        toolResult.stdout ? `stdout:\n${truncateForTrace(toolResult.stdout)}` : '',
+        toolResult.stderr ? `stderr:\n${truncateForTrace(toolResult.stderr)}` : ''
+      ].filter((line) => line.length > 0);
+
+      input.onEvent?.({
+        type: 'trace',
+        trace: {
+          traceKind: 'action',
+          text: traceResultLines.join('\n\n'),
+          actionKind: 'command-result'
+        }
+      });
+
+      nativeHistory.push({
+        role: 'tool',
+        content: stringifyToolResult({
+          command: toolResult.command,
+          cwd: toolResult.cwd,
+          exitCode: toolResult.exitCode,
+          timedOut: toolResult.timedOut,
+          stdout: toolResult.stdout,
+          stderr: toolResult.stderr
+        })
+      });
+    }
+  }
+
+  throw new Error(`Local native tool mode reached max steps (${MAX_LOCAL_TOOL_STEPS}) without finishing.`);
+};
+
+const runLocalOllamaProtocol: ProviderRunner = async (input) => {
   if (input.provider.type !== 'local' || input.provider.auth_kind !== 'api_key') {
     throw new Error('Local runner received incompatible provider configuration.');
   }
@@ -611,4 +775,35 @@ export const runLocalOllama: ProviderRunner = async (input) => {
     inputTokens: totalInputTokens > 0 ? totalInputTokens : undefined,
     outputTokens: totalOutputTokens > 0 ? totalOutputTokens : undefined
   };
+};
+
+export const runLocalOllama: ProviderRunner = async (input) => {
+  if (input.provider.type !== 'local' || input.provider.auth_kind !== 'api_key') {
+    throw new Error('Local runner received incompatible provider configuration.');
+  }
+
+  const preferNativeTools = input.provider.auth_kind === 'api_key';
+  if (!preferNativeTools) {
+    return runLocalOllamaProtocol(input);
+  }
+
+  try {
+    return await runLocalOllamaNativeTools(input);
+  } catch (error) {
+    if (error instanceof RequestCancelledError) {
+      throw error;
+    }
+
+    const message = error instanceof Error ? error.message : '';
+    if (!(error instanceof NativeToolFallbackError)) {
+      const knownFallbackPattern =
+        /tool|function|unsupported|schema|arguments|empty final response|no text and no tool calls/i.test(message);
+      if (!knownFallbackPattern) {
+        throw error;
+      }
+    }
+
+    input.onEvent?.({ type: 'status', text: 'Falling back to compatibility tool protocol...' });
+    return runLocalOllamaProtocol(input);
+  }
 };

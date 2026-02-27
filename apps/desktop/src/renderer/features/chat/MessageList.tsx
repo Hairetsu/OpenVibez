@@ -294,13 +294,17 @@ const buildTimelineGroups = (
   let currentThought: string | null = null;
 
   for (const entry of timeline) {
+    if (entry.type === "run_marker") {
+      continue;
+    }
+
     if (entry.type === "trace") {
       if (entry.trace.traceKind === "thought") {
         currentThought = entry.trace.text.trim();
       } else {
         groups.push({ kind: "action", trace: entry.trace, text: "" });
       }
-    } else {
+    } else if (entry.type === "text") {
       groups.push({ kind: "text", content: entry.content });
     }
   }
@@ -317,6 +321,33 @@ const buildTimelineGroups = (
   }
 
   return { groups, currentThought };
+};
+
+const splitTimelineByRunMarkers = (
+  timeline: StreamTimelineEntry[],
+): { segments: StreamTimelineEntry[][]; hasMarkers: boolean } => {
+  const segments: StreamTimelineEntry[][] = [];
+  let current: StreamTimelineEntry[] = [];
+  let hasMarkers = false;
+
+  for (const entry of timeline) {
+    if (entry.type === "run_marker") {
+      hasMarkers = true;
+      if (current.length > 0) {
+        segments.push(current);
+        current = [];
+      }
+      continue;
+    }
+
+    current.push(entry);
+  }
+
+  if (current.length > 0) {
+    segments.push(current);
+  }
+
+  return { segments, hasMarkers };
 };
 
 const basename = (filePath: string): string => {
@@ -531,14 +562,63 @@ export const MessageList = ({
   statusTrail = [],
 }: MessageListProps) => {
   const bottomRef = useRef<HTMLDivElement>(null);
-  const { groups: timelineGroups, currentThought } = useMemo(
-    () => buildTimelineGroups(timeline),
-    [timeline],
-  );
+
+  const { assistantGroupsById, liveTimelineGroups, liveCurrentThought } =
+    useMemo(() => {
+      const assistantMessages = messages.filter(
+        (message) => message.role === "assistant",
+      );
+      const { segments, hasMarkers } = splitTimelineByRunMarkers(timeline);
+
+      const byAssistantId: Record<string, TimelineGroup[]> = {};
+      let liveGroups: TimelineGroup[] = [];
+      let currentThought: string | null = null;
+
+      if (hasMarkers) {
+        const pendingSegments = [...segments];
+
+        if (streaming && pendingSegments.length > 0) {
+          const liveBuilt = buildTimelineGroups(
+            pendingSegments.pop() ?? [],
+          );
+          liveGroups = liveBuilt.groups;
+          currentThought = liveBuilt.currentThought;
+        }
+
+        for (
+          let assistantIndex = assistantMessages.length - 1,
+            segmentIndex = pendingSegments.length - 1;
+          assistantIndex >= 0 && segmentIndex >= 0;
+          assistantIndex -= 1, segmentIndex -= 1
+        ) {
+          byAssistantId[assistantMessages[assistantIndex].id] =
+            buildTimelineGroups(pendingSegments[segmentIndex] ?? []).groups;
+        }
+      } else if (segments.length > 0) {
+        if (assistantMessages.length > 0) {
+          byAssistantId[assistantMessages[assistantMessages.length - 1].id] =
+            buildTimelineGroups(segments[segments.length - 1] ?? []).groups;
+        }
+
+        if (streaming) {
+          const liveBuilt = buildTimelineGroups(
+            segments[segments.length - 1] ?? [],
+          );
+          liveGroups = liveBuilt.groups;
+          currentThought = liveBuilt.currentThought;
+        }
+      }
+
+      return {
+        assistantGroupsById: byAssistantId,
+        liveTimelineGroups: liveGroups,
+        liveCurrentThought: currentThought,
+      };
+    }, [messages, streaming, timeline]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, timelineGroups.length, currentThought]);
+  }, [messages.length, liveTimelineGroups.length, liveCurrentThought]);
 
   if (
     messages.length === 0 &&
@@ -560,13 +640,304 @@ export const MessageList = ({
     );
   }
 
+  const renderTimelineGroup = (group: TimelineGroup, key: string) => {
+    if (group.kind === "text") {
+      const inlineFiles = extractInlineFiles(group.content);
+      return (
+        <div key={key} className="animate-rise grid gap-1.5">
+          <MarkdownText
+            content={group.content}
+            className="whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/75"
+          />
+          {inlineFiles.length > 0 && (
+            <details className="group/det rounded-lg border border-border/40 bg-card/40">
+              <summary className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-[12px]">
+                <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
+                <Search className="h-3 w-3 text-sky-400/70" />
+                <span className="text-foreground/70">
+                  Explored {inlineFiles.length} file
+                  {inlineFiles.length !== 1 ? "s" : ""}
+                </span>
+              </summary>
+              <div className="flex flex-wrap gap-1.5 border-t border-border/30 px-3 py-2">
+                {inlineFiles.map((f) => (
+                  <span
+                    key={f}
+                    className="inline-flex items-center gap-1 rounded-md border border-border/40 bg-card/50 px-1.5 py-0.5 font-mono text-[10px] text-foreground/55"
+                  >
+                    <FileCode2 className="h-2.5 w-2.5" />
+                    {f}
+                  </span>
+                ))}
+              </div>
+            </details>
+          )}
+        </div>
+      );
+    }
+
+    const summary = summarizeAction(group.trace);
+
+    if (summary.type === "edited") {
+      return (
+        <div key={key} className="animate-rise grid gap-1">
+          {group.text && (
+            <MarkdownText
+              content={group.text}
+              className="text-[12px] leading-relaxed text-foreground/75"
+            />
+          )}
+          {summary.files.map((file) => (
+            <details
+              key={file.path}
+              className="group/det rounded-lg border border-border/40 bg-card/40"
+            >
+              <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px]">
+                <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
+                <FilePenLine className="h-3 w-3 text-foreground/50" />
+                <span className="font-medium text-foreground/80">
+                  {file.verb === "add"
+                    ? "Created"
+                    : file.verb === "delete"
+                      ? "Deleted"
+                      : "Edited"}{" "}
+                  {basename(file.path)}
+                </span>
+                {(file.added > 0 || file.removed > 0) && (
+                  <span className="ml-auto flex gap-1.5 font-mono text-[10px]">
+                    {file.added > 0 && (
+                      <span className="text-emerald-400">+{file.added}</span>
+                    )}
+                    {file.removed > 0 && (
+                      <span className="text-rose-400">-{file.removed}</span>
+                    )}
+                  </span>
+                )}
+              </summary>
+              <div className="border-t border-border/30 px-3 py-2">
+                <span className="font-mono text-[10px] text-foreground/50">
+                  {file.path}
+                </span>
+              </div>
+            </details>
+          ))}
+        </div>
+      );
+    }
+
+    if (summary.type === "command") {
+      const formattedCommand = formatCommandForDisplay(summary.command);
+      const preview = commandPreview(
+        summary.command.split("\n")[0] ?? summary.command,
+      );
+      return (
+        <div key={key} className="animate-rise grid gap-1">
+          {group.text && (
+            <MarkdownText
+              content={group.text}
+              className="text-[12px] leading-relaxed text-foreground/75"
+            />
+          )}
+          <details className="group/det rounded-lg border border-border/40 bg-card/40">
+            <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px]">
+              <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
+              <TerminalSquare className="h-3 w-3 text-emerald-400/70" />
+              <span className="min-w-0 flex-1 truncate font-mono text-foreground/70">
+                {preview}
+              </span>
+            </summary>
+            <div className="border-t border-border/30 bg-black/20 px-3 py-2">
+              <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-emerald-200/80">
+                <code>{formattedCommand}</code>
+              </pre>
+              {summary.cwd && (
+                <p className="mt-1.5 font-mono text-[10px] text-foreground/40">
+                  cwd: {summary.cwd}
+                </p>
+              )}
+            </div>
+          </details>
+        </div>
+      );
+    }
+
+    if (summary.type === "result") {
+      return (
+        <div key={key} className="animate-rise flex items-center gap-2">
+          <span
+            className={cn(
+              "rounded-md border px-1.5 py-0.5 font-mono text-[10px]",
+              summary.exit === "0"
+                ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300"
+                : "border-rose-400/30 bg-rose-400/10 text-rose-300",
+            )}
+          >
+            exit {summary.exit ?? "?"}
+          </span>
+          {summary.timedOut && (
+            <span className="rounded-md border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-300">
+              timeout
+            </span>
+          )}
+          {summary.stdout && (
+            <details className="min-w-0 flex-1">
+              <summary className="cursor-pointer text-[10px] text-foreground/40 hover:text-foreground/60">
+                stdout
+              </summary>
+              <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded-lg border border-border/30 bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-foreground/70">
+                <code>{summary.stdout}</code>
+              </pre>
+            </details>
+          )}
+          {summary.stderr && (
+            <details className="min-w-0 flex-1">
+              <summary className="cursor-pointer text-[10px] text-foreground/40 hover:text-foreground/60">
+                stderr
+              </summary>
+              <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded-lg border border-border/30 bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200/70">
+                <code>{summary.stderr}</code>
+              </pre>
+            </details>
+          )}
+        </div>
+      );
+    }
+
+    if (summary.type === "explored") {
+      return (
+        <div key={key} className="animate-rise grid gap-1">
+          {group.text && (
+            <MarkdownText
+              content={group.text}
+              className="text-[12px] leading-relaxed text-foreground/75"
+            />
+          )}
+          <details className="group/det rounded-lg border border-border/40 bg-card/40">
+            <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px]">
+              <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
+              <Search className="h-3 w-3 text-sky-400/70" />
+              <span className="text-foreground/70">
+                Explored {summary.count} search
+                {summary.count !== 1 ? "es" : ""}
+              </span>
+            </summary>
+            <div className="border-t border-border/30 px-3 py-2">
+              <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-foreground/50">
+                {summary.detail}
+              </pre>
+            </div>
+          </details>
+        </div>
+      );
+    }
+
+    if (summary.type === "checklist") {
+      return (
+        <ul key={key} className="animate-rise grid gap-1">
+          {summary.items.map((item) => (
+            <li
+              key={`${item.index}-${item.text}`}
+              className="flex items-start gap-2 text-[12px]"
+            >
+              {item.done ? (
+                <CheckCircle2 className="mt-0.5 h-3 w-3 text-emerald-400" />
+              ) : (
+                <Circle className="mt-0.5 h-3 w-3 text-foreground/25" />
+              )}
+              <span
+                className={cn(
+                  "leading-relaxed",
+                  item.done ? "text-foreground/60" : "text-foreground/80",
+                )}
+              >
+                {item.text}
+              </span>
+            </li>
+          ))}
+        </ul>
+      );
+    }
+
+    return (
+      <div key={key} className="animate-rise grid gap-1">
+        {group.text && (
+          <MarkdownText
+            content={group.text}
+            className="text-[12px] leading-relaxed text-foreground/75"
+          />
+        )}
+        {summary.content && !group.text && (
+          <MarkdownText
+            content={summary.content}
+            className="text-[12px] leading-relaxed text-foreground/75"
+          />
+        )}
+        {summary.files.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {summary.files.map((loc) => (
+              <span
+                key={loc}
+                className="inline-flex items-center gap-1 rounded-md border border-border/40 bg-card/40 px-1.5 py-0.5 font-mono text-[10px] text-foreground/55"
+              >
+                <FileCode2 className="h-2.5 w-2.5" />
+                {basename(loc)}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="scroll-soft relative flex-1 overflow-auto [background:radial-gradient(ellipse_at_0%_0%,hsl(var(--primary)/0.03),transparent_60%),radial-gradient(ellipse_at_100%_100%,hsl(var(--accent)/0.03),transparent_60%)] [background-attachment:fixed]">
       <div className="relative mx-auto max-w-4xl px-4 py-5">
         <div className="grid gap-3">
-          {messages
-            .filter((message) => message.role !== "assistant")
-            .map((message) => (
+          {messages.map((message) => {
+            if (message.role === "assistant") {
+              const mappedGroups = assistantGroupsById[message.id] ?? [];
+              const hasTextGroup = mappedGroups.some(
+                (group) =>
+                  group.kind === "text" && group.content.trim().length > 0,
+              );
+              const fallbackTextGroup: TimelineGroup = {
+                kind: "text",
+                content: message.content,
+              };
+              const groupsToRender =
+                hasTextGroup || !message.content.trim()
+                  ? mappedGroups
+                  : [...mappedGroups, fallbackTextGroup];
+
+              if (groupsToRender.length > 0) {
+                return (
+                  <div key={message.id} className="grid gap-1.5">
+                    {groupsToRender.map((group, index) =>
+                      renderTimelineGroup(group, `${message.id}-${index}`),
+                    )}
+                  </div>
+                );
+              }
+
+              return (
+                <article
+                  key={message.id}
+                  className="mr-auto max-w-[90%] rounded-2xl border border-border/60 bg-card/[0.65] px-4 py-3 shadow-[0_14px_45px_hsl(var(--shadow)/0.05)] backdrop-blur-sm"
+                >
+                  <div className="mb-2 flex items-center gap-2">
+                    <span className="font-display text-[10px] uppercase tracking-[0.2em] text-foreground/[0.55]">
+                      {roleLabel(message.role)}
+                    </span>
+                  </div>
+                  <MarkdownText
+                    content={message.content}
+                    className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90"
+                  />
+                </article>
+              );
+            }
+
+            return (
               <article
                 key={message.id}
                 className={cn(
@@ -593,271 +964,18 @@ export const MessageList = ({
                   className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90"
                 />
               </article>
-            ))}
-
-          {timelineGroups.map((group, index) => {
-            if (group.kind === "text") {
-              const inlineFiles = extractInlineFiles(group.content);
-              return (
-                <div key={`tl-${index}`} className="animate-rise grid gap-1.5">
-                  <MarkdownText
-                    content={group.content}
-                    className="whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/75"
-                  />
-                  {inlineFiles.length > 0 && (
-                    <details className="group/det rounded-lg border border-border/40 bg-card/40">
-                      <summary className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-[12px]">
-                        <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
-                        <Search className="h-3 w-3 text-sky-400/70" />
-                        <span className="text-foreground/70">
-                          Explored {inlineFiles.length} file
-                          {inlineFiles.length !== 1 ? "s" : ""}
-                        </span>
-                      </summary>
-                      <div className="flex flex-wrap gap-1.5 border-t border-border/30 px-3 py-2">
-                        {inlineFiles.map((f) => (
-                          <span
-                            key={f}
-                            className="inline-flex items-center gap-1 rounded-md border border-border/40 bg-card/50 px-1.5 py-0.5 font-mono text-[10px] text-foreground/55"
-                          >
-                            <FileCode2 className="h-2.5 w-2.5" />
-                            {f}
-                          </span>
-                        ))}
-                      </div>
-                    </details>
-                  )}
-                </div>
-              );
-            }
-
-            const summary = summarizeAction(group.trace);
-
-            if (summary.type === "edited") {
-              return (
-                <div key={`tl-${index}`} className="animate-rise grid gap-1">
-                  {group.text && (
-                    <MarkdownText
-                      content={group.text}
-                      className="text-[12px] leading-relaxed text-foreground/75"
-                    />
-                  )}
-                  {summary.files.map((file) => (
-                    <details
-                      key={file.path}
-                      className="group/det rounded-lg border border-border/40 bg-card/40"
-                    >
-                      <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px]">
-                        <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
-                        <FilePenLine className="h-3 w-3 text-foreground/50" />
-                        <span className="font-medium text-foreground/80">
-                          {file.verb === "add"
-                            ? "Created"
-                            : file.verb === "delete"
-                              ? "Deleted"
-                              : "Edited"}{" "}
-                          {basename(file.path)}
-                        </span>
-                        {(file.added > 0 || file.removed > 0) && (
-                          <span className="ml-auto flex gap-1.5 font-mono text-[10px]">
-                            {file.added > 0 && (
-                              <span className="text-emerald-400">
-                                +{file.added}
-                              </span>
-                            )}
-                            {file.removed > 0 && (
-                              <span className="text-rose-400">
-                                -{file.removed}
-                              </span>
-                            )}
-                          </span>
-                        )}
-                      </summary>
-                      <div className="border-t border-border/30 px-3 py-2">
-                        <span className="font-mono text-[10px] text-foreground/50">
-                          {file.path}
-                        </span>
-                      </div>
-                    </details>
-                  ))}
-                </div>
-              );
-            }
-
-            if (summary.type === "command") {
-              const formattedCommand = formatCommandForDisplay(summary.command);
-              const preview = commandPreview(
-                summary.command.split("\n")[0] ?? summary.command,
-              );
-              return (
-                <div key={`tl-${index}`} className="animate-rise grid gap-1">
-                  {group.text && (
-                    <MarkdownText
-                      content={group.text}
-                      className="text-[12px] leading-relaxed text-foreground/75"
-                    />
-                  )}
-                  <details className="group/det rounded-lg border border-border/40 bg-card/40">
-                    <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px]">
-                      <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
-                      <TerminalSquare className="h-3 w-3 text-emerald-400/70" />
-                      <span className="min-w-0 flex-1 truncate font-mono text-foreground/70">
-                        {preview}
-                      </span>
-                    </summary>
-                    <div className="border-t border-border/30 bg-black/20 px-3 py-2">
-                      <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-emerald-200/80">
-                        <code>{formattedCommand}</code>
-                      </pre>
-                      {summary.cwd && (
-                        <p className="mt-1.5 font-mono text-[10px] text-foreground/40">
-                          cwd: {summary.cwd}
-                        </p>
-                      )}
-                    </div>
-                  </details>
-                </div>
-              );
-            }
-
-            if (summary.type === "result") {
-              return (
-                <div
-                  key={`tl-${index}`}
-                  className="animate-rise flex items-center gap-2"
-                >
-                  <span
-                    className={cn(
-                      "rounded-md border px-1.5 py-0.5 font-mono text-[10px]",
-                      summary.exit === "0"
-                        ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300"
-                        : "border-rose-400/30 bg-rose-400/10 text-rose-300",
-                    )}
-                  >
-                    exit {summary.exit ?? "?"}
-                  </span>
-                  {summary.timedOut && (
-                    <span className="rounded-md border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-300">
-                      timeout
-                    </span>
-                  )}
-                  {summary.stdout && (
-                    <details className="min-w-0 flex-1">
-                      <summary className="cursor-pointer text-[10px] text-foreground/40 hover:text-foreground/60">
-                        stdout
-                      </summary>
-                      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded-lg border border-border/30 bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-foreground/70">
-                        <code>{summary.stdout}</code>
-                      </pre>
-                    </details>
-                  )}
-                  {summary.stderr && (
-                    <details className="min-w-0 flex-1">
-                      <summary className="cursor-pointer text-[10px] text-foreground/40 hover:text-foreground/60">
-                        stderr
-                      </summary>
-                      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded-lg border border-border/30 bg-black/20 px-2 py-1.5 text-[11px] leading-relaxed text-rose-200/70">
-                        <code>{summary.stderr}</code>
-                      </pre>
-                    </details>
-                  )}
-                </div>
-              );
-            }
-
-            if (summary.type === "explored") {
-              return (
-                <div key={`tl-${index}`} className="animate-rise grid gap-1">
-                  {group.text && (
-                    <MarkdownText
-                      content={group.text}
-                      className="text-[12px] leading-relaxed text-foreground/75"
-                    />
-                  )}
-                  <details className="group/det rounded-lg border border-border/40 bg-card/40">
-                    <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px]">
-                      <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
-                      <Search className="h-3 w-3 text-sky-400/70" />
-                      <span className="text-foreground/70">
-                        Explored {summary.count} search
-                        {summary.count !== 1 ? "es" : ""}
-                      </span>
-                    </summary>
-                    <div className="border-t border-border/30 px-3 py-2">
-                      <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-foreground/50">
-                        {summary.detail}
-                      </pre>
-                    </div>
-                  </details>
-                </div>
-              );
-            }
-
-            if (summary.type === "checklist") {
-              return (
-                <ul key={`tl-${index}`} className="animate-rise grid gap-1">
-                  {summary.items.map((item) => (
-                    <li
-                      key={`${item.index}-${item.text}`}
-                      className="flex items-start gap-2 text-[12px]"
-                    >
-                      {item.done ? (
-                        <CheckCircle2 className="mt-0.5 h-3 w-3 text-emerald-400" />
-                      ) : (
-                        <Circle className="mt-0.5 h-3 w-3 text-foreground/25" />
-                      )}
-                      <span
-                        className={cn(
-                          "leading-relaxed",
-                          item.done
-                            ? "text-foreground/60"
-                            : "text-foreground/80",
-                        )}
-                      >
-                        {item.text}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              );
-            }
-
-            return (
-              <div key={`tl-${index}`} className="animate-rise grid gap-1">
-                {group.text && (
-                  <MarkdownText
-                    content={group.text}
-                    className="text-[12px] leading-relaxed text-foreground/75"
-                  />
-                )}
-                {summary.content && !group.text && (
-                  <MarkdownText
-                    content={summary.content}
-                    className="text-[12px] leading-relaxed text-foreground/75"
-                  />
-                )}
-                {summary.files.length > 0 && (
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    {summary.files.map((loc) => (
-                      <span
-                        key={loc}
-                        className="inline-flex items-center gap-1 rounded-md border border-border/40 bg-card/40 px-1.5 py-0.5 font-mono text-[10px] text-foreground/55"
-                      >
-                        <FileCode2 className="h-2.5 w-2.5" />
-                        {basename(loc)}
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </div>
             );
           })}
+
+          {liveTimelineGroups.map((group, index) =>
+            renderTimelineGroup(group, `live-${index}`),
+          )}
 
           {streaming && (
             <div className="flex items-center gap-2 py-1">
               <Loader2 className="h-3 w-3 animate-spin text-foreground/40" />
               <span className="text-[11px] text-foreground/50">
-                {currentThought ?? status ?? "Thinking..."}
+                {liveCurrentThought ?? status ?? "Thinking..."}
               </span>
             </div>
           )}

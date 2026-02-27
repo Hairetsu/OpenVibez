@@ -7,12 +7,15 @@ import {
   createSession,
   failAssistantRun,
   getAssistantRunByClientRequest,
+  getSetting,
   getMessageById,
   getProviderById,
   getSessionById,
   getWorkspaceById,
+  listAssistantRunsByStatus,
   listMessages,
   listSessions,
+  markAssistantRunRecovered,
   markAssistantRunUserMessage,
   markProviderUsed,
   recordUsageEvent,
@@ -339,7 +342,73 @@ const mapRunnerEventToStream = (
   });
 };
 
+const resolveCodexOptions = (): RunnerContext['codexOptions'] => {
+  const approval = getSetting('codex_approval_policy');
+  const outputSchema = getSetting('codex_output_schema_json');
+
+  const approvalPolicy =
+    approval === 'untrusted' || approval === 'on-failure' || approval === 'on-request' || approval === 'never'
+      ? approval
+      : undefined;
+
+  const outputSchemaJson = typeof outputSchema === 'string' && outputSchema.trim() ? outputSchema.trim() : undefined;
+
+  return {
+    approvalPolicy,
+    outputSchemaJson
+  };
+};
+
+const reconcileInterruptedRuns = (): void => {
+  const staleRuns = listAssistantRunsByStatus('running');
+  if (staleRuns.length === 0) {
+    return;
+  }
+
+  for (const run of staleRuns) {
+    try {
+      if (!run.session_id || run.assistant_message_id) {
+        markAssistantRunRecovered({
+          runId: run.id,
+          status: 'failed',
+          errorText: run.error_text ?? 'Recovered stale run without replayable state.'
+        });
+        continue;
+      }
+
+      if (!getSessionById(run.session_id)) {
+        markAssistantRunRecovered({
+          runId: run.id,
+          status: 'failed',
+          errorText: 'Recovered stale run for missing session.'
+        });
+        continue;
+      }
+
+      const assistantMessage = addMessage({
+        sessionId: run.session_id,
+        role: 'assistant',
+        content: 'Previous run was interrupted when OpenVibez closed. Please resend your prompt to continue.'
+      });
+
+      markAssistantRunRecovered({
+        runId: run.id,
+        status: 'failed',
+        assistantMessageId: assistantMessage.id,
+        errorText: 'Recovered stale run after restart.'
+      });
+    } catch (error) {
+      logger.warn('Failed to reconcile stale assistant run', {
+        runId: run.id,
+        message: asMessage(error)
+      });
+    }
+  }
+};
+
 export const registerChatHandlers = (): void => {
+  reconcileInterruptedRuns();
+
   ipcMain.handle('session:create', (_event, input) => {
     const parsed = sessionCreateSchema.parse(input);
     const session = createSession(parsed);
@@ -542,6 +611,7 @@ export const registerChatHandlers = (): void => {
         history,
         accessMode: effectiveAccessMode,
         workspace,
+        codexOptions: resolveCodexOptions(),
         signal: controller.signal,
         onEvent: (runnerEvent) => {
           mapRunnerEventToStream(event, streamId, parsed.sessionId, runnerEvent, (delta) => {

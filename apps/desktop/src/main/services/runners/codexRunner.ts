@@ -18,6 +18,8 @@ export const runCodexSubscription: ProviderRunner = async (input) => {
     cwd: input.workspace?.root_path,
     model: input.requestedModelId,
     fullAccess: input.accessMode === 'root',
+    approvalPolicy: input.codexOptions?.approvalPolicy,
+    outputSchemaJson: input.codexOptions?.outputSchemaJson,
     signal: input.signal,
     onEvent: (event) => {
       if (event.type === 'status' && event.text) {

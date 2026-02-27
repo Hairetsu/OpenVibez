@@ -474,6 +474,12 @@ export const getAssistantRunByClientRequest = (input: {
     .get(input.sessionId, input.clientRequestId) as AssistantRunRow | undefined;
 };
 
+export const listAssistantRunsByStatus = (status: AssistantRunRow['status']): AssistantRunRow[] => {
+  return getDb()
+    .prepare('SELECT * FROM assistant_runs WHERE status = ? ORDER BY created_at ASC')
+    .all(status) as AssistantRunRow[];
+};
+
 export const createAssistantRun = (input: {
   sessionId: string;
   clientRequestId: string;
@@ -521,6 +527,19 @@ export const failAssistantRun = (input: {
   getDb()
     .prepare('UPDATE assistant_runs SET status = ?, error_text = ?, updated_at = ? WHERE id = ?')
     .run('failed', input.errorText, now(), input.runId);
+};
+
+export const markAssistantRunRecovered = (input: {
+  runId: string;
+  status: AssistantRunRow['status'];
+  assistantMessageId?: string;
+  errorText?: string;
+}): void => {
+  getDb()
+    .prepare(
+      'UPDATE assistant_runs SET status = ?, assistant_message_id = COALESCE(?, assistant_message_id), error_text = ?, updated_at = ? WHERE id = ?'
+    )
+    .run(input.status, input.assistantMessageId ?? null, input.errorText ?? null, now(), input.runId);
 };
 
 export const getSetting = (key: string): unknown | null => {

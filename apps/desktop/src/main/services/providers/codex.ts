@@ -30,6 +30,8 @@ export type CodexCompletionInput = {
   cwd?: string;
   model?: string;
   fullAccess?: boolean;
+  approvalPolicy?: 'untrusted' | 'on-failure' | 'on-request' | 'never';
+  outputSchemaJson?: string;
   signal?: AbortSignal;
   onEvent?: (event: CodexStreamEvent) => void;
 };
@@ -504,6 +506,7 @@ export const getCodexDeviceAuthState = (): CodexDeviceAuthState => deviceAuthSta
 
 export const createCodexCompletion = async (input: CodexCompletionInput): Promise<CodexCompletionResult> => {
   const messagePath = path.join(os.tmpdir(), `openvibez-codex-${randomUUID()}.txt`);
+  const outputSchemaPath = path.join(os.tmpdir(), `openvibez-codex-schema-${randomUUID()}.json`);
   const prompt = buildCodexPrompt(input.history);
 
   const args = ['exec', '--skip-git-repo-check', '--json', '--output-last-message', messagePath];
@@ -518,6 +521,26 @@ export const createCodexCompletion = async (input: CodexCompletionInput): Promis
     args.push('--model', input.model);
   }
 
+  if (!input.fullAccess && input.approvalPolicy) {
+    args.push('--ask-for-approval', input.approvalPolicy);
+  }
+
+  if (input.outputSchemaJson?.trim()) {
+    let parsedSchema: unknown;
+    try {
+      parsedSchema = JSON.parse(input.outputSchemaJson);
+    } catch {
+      throw new Error('Codex output schema must be valid JSON.');
+    }
+
+    if (!parsedSchema || typeof parsedSchema !== 'object' || Array.isArray(parsedSchema)) {
+      throw new Error('Codex output schema must be a JSON object.');
+    }
+
+    await fs.writeFile(outputSchemaPath, JSON.stringify(parsedSchema, null, 2), 'utf8');
+    args.push('--output-schema', outputSchemaPath);
+  }
+
   if (input.cwd) {
     args.push('-C', input.cwd);
   }
@@ -525,179 +548,183 @@ export const createCodexCompletion = async (input: CodexCompletionInput): Promis
   args.push(prompt);
   input.onEvent?.({ type: 'status', text: input.fullAccess ? 'Running with root-level access...' : 'Running in scoped workspace mode...' });
 
-  const { stdout, stderr, code, usage, assistantText } = await new Promise<{
-    stdout: string;
-    stderr: string;
-    code: number | null;
-    usage: { inputTokens?: number; outputTokens?: number };
-    assistantText: string;
-  }>((resolve, reject) => {
-    if (input.signal?.aborted) {
-      const abortError = new Error('Request cancelled by user.');
-      abortError.name = 'AbortError';
-      reject(abortError);
-      return;
-    }
-
-    const child = spawn(resolveCodexCommand(), args, {
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    let stdout = '';
-    let stderr = '';
-    let assistantText = '';
-    let usage: { inputTokens?: number; outputTokens?: number } = {};
-    let lineBuffer = '';
-    let settled = false;
-    let onAbort: (() => void) | null = null;
-
-    const done = (fn: () => void) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      if (input.signal && onAbort) {
-        input.signal.removeEventListener('abort', onAbort);
-      }
-      fn();
-    };
-
-    onAbort = () => {
-      const abortError = new Error('Request cancelled by user.');
-      abortError.name = 'AbortError';
-      try {
-        child.kill('SIGTERM');
-        setTimeout(() => child.kill('SIGKILL'), 3000);
-      } catch {
-        // ignore process kill errors
-      }
-      done(() => reject(abortError));
-    };
-
-    if (input.signal) {
-      input.signal.addEventListener('abort', onAbort, { once: true });
-    }
-
-    const processLine = (line: string) => {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('{')) {
+  try {
+    const { stdout, stderr, code, usage, assistantText } = await new Promise<{
+      stdout: string;
+      stderr: string;
+      code: number | null;
+      usage: { inputTokens?: number; outputTokens?: number };
+      assistantText: string;
+    }>((resolve, reject) => {
+      if (input.signal?.aborted) {
+        const abortError = new Error('Request cancelled by user.');
+        abortError.name = 'AbortError';
+        reject(abortError);
         return;
       }
 
-      let event: unknown;
-      try {
-        event = JSON.parse(trimmed);
-      } catch {
-        return;
-      }
+      const child = spawn(resolveCodexCommand(), args, {
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
 
-      const parsed = event as {
-        type?: string;
-        usage?: { input_tokens?: number; output_tokens?: number };
-        item?: Record<string, unknown>;
+      let stdout = '';
+      let stderr = '';
+      let assistantText = '';
+      let usage: { inputTokens?: number; outputTokens?: number } = {};
+      let lineBuffer = '';
+      let settled = false;
+      let onAbort: (() => void) | null = null;
+
+      const done = (fn: () => void) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (input.signal && onAbort) {
+          input.signal.removeEventListener('abort', onAbort);
+        }
+        fn();
       };
 
-      if (parsed.type === 'turn.started') {
-        input.onEvent?.({ type: 'status', text: 'Planning...' });
-        return;
+      onAbort = () => {
+        const abortError = new Error('Request cancelled by user.');
+        abortError.name = 'AbortError';
+        try {
+          child.kill('SIGTERM');
+          setTimeout(() => child.kill('SIGKILL'), 3000);
+        } catch {
+          // ignore process kill errors
+        }
+        done(() => reject(abortError));
+      };
+
+      if (input.signal) {
+        input.signal.addEventListener('abort', onAbort, { once: true });
       }
 
-      if (parsed.type === 'turn.completed' && parsed.usage) {
-        usage = {
-          inputTokens: parsed.usage.input_tokens,
-          outputTokens: parsed.usage.output_tokens
+      const processLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('{')) {
+          return;
+        }
+
+        let event: unknown;
+        try {
+          event = JSON.parse(trimmed);
+        } catch {
+          return;
+        }
+
+        const parsed = event as {
+          type?: string;
+          usage?: { input_tokens?: number; output_tokens?: number };
+          item?: Record<string, unknown>;
         };
-        input.onEvent?.({ type: 'status', text: 'Finalizing response...' });
-        return;
-      }
 
-      if (parsed.type !== 'item.completed' || !parsed.item) {
-        return;
-      }
+        if (parsed.type === 'turn.started') {
+          input.onEvent?.({ type: 'status', text: 'Planning...' });
+          return;
+        }
 
-      const itemType = typeof parsed.item.type === 'string' ? parsed.item.type : '';
-      const itemName = typeof parsed.item.name === 'string' ? parsed.item.name : '';
-      const text = extractItemText(parsed.item);
-      if (!text && !itemName && !itemType) {
-        return;
-      }
+        if (parsed.type === 'turn.completed' && parsed.usage) {
+          usage = {
+            inputTokens: parsed.usage.input_tokens,
+            outputTokens: parsed.usage.output_tokens
+          };
+          input.onEvent?.({ type: 'status', text: 'Finalizing response...' });
+          return;
+        }
 
-      if (itemType === 'reasoning') {
+        if (parsed.type !== 'item.completed' || !parsed.item) {
+          return;
+        }
+
+        const itemType = typeof parsed.item.type === 'string' ? parsed.item.type : '';
+        const itemName = typeof parsed.item.name === 'string' ? parsed.item.name : '';
+        const text = extractItemText(parsed.item);
+        if (!text && !itemName && !itemType) {
+          return;
+        }
+
+        if (itemType === 'reasoning') {
+          input.onEvent?.({
+            type: 'trace',
+            traceKind: classifyReasoning(text),
+            text
+          });
+          return;
+        }
+
+        if (itemType === 'agent_message') {
+          assistantText += text;
+          input.onEvent?.({ type: 'assistant_delta', delta: text });
+          return;
+        }
+
+        const traceText = text || `${itemName || itemType}`;
         input.onEvent?.({
           type: 'trace',
-          traceKind: classifyReasoning(text),
-          text
+          traceKind: 'action',
+          text: traceText,
+          actionKind: classifyAction(itemType, itemName, traceText)
         });
-        return;
-      }
+      };
 
-      if (itemType === 'agent_message') {
-        assistantText += text;
-        input.onEvent?.({ type: 'assistant_delta', delta: text });
-        return;
-      }
+      child.stdout.on('data', (chunk) => {
+        const text = String(chunk);
+        stdout += text;
+        lineBuffer += text;
 
-      const traceText = text || `${itemName || itemType}`;
-      input.onEvent?.({
-        type: 'trace',
-        traceKind: 'action',
-        text: traceText,
-        actionKind: classifyAction(itemType, itemName, traceText)
+        const lines = lineBuffer.split(/\r?\n/);
+        lineBuffer = lines.pop() ?? '';
+        for (const line of lines) {
+          processLine(line);
+        }
       });
+
+      child.stderr.on('data', (chunk) => {
+        stderr += String(chunk);
+      });
+
+      child.on('error', (error) => {
+        done(() => reject(mapSpawnError(error)));
+      });
+
+      child.on('close', (childCode) => {
+        if (lineBuffer.trim()) {
+          processLine(lineBuffer);
+        }
+
+        done(() => resolve({ stdout, stderr, code: childCode, usage, assistantText }));
+      });
+    });
+
+    if (code !== 0) {
+      throw new Error(stripAnsi(stderr.trim() || stdout.trim() || `codex exec failed with code ${code ?? 'unknown'}`));
+    }
+
+    let text = '';
+    try {
+      text = (await fs.readFile(messagePath, 'utf8')).trim();
+    } catch {
+      text = '';
+    }
+
+    if (!text && assistantText.trim()) {
+      text = assistantText.trim();
+    }
+
+    if (!text) {
+      throw new Error('codex exec returned empty output');
+    }
+
+    return {
+      text,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens
     };
-
-    child.stdout.on('data', (chunk) => {
-      const text = String(chunk);
-      stdout += text;
-      lineBuffer += text;
-
-      const lines = lineBuffer.split(/\r?\n/);
-      lineBuffer = lines.pop() ?? '';
-      for (const line of lines) {
-        processLine(line);
-      }
-    });
-
-    child.stderr.on('data', (chunk) => {
-      stderr += String(chunk);
-    });
-
-    child.on('error', (error) => {
-      done(() => reject(mapSpawnError(error)));
-    });
-
-    child.on('close', (childCode) => {
-      if (lineBuffer.trim()) {
-        processLine(lineBuffer);
-      }
-
-      done(() => resolve({ stdout, stderr, code: childCode, usage, assistantText }));
-    });
-  });
-
-  if (code !== 0) {
-    throw new Error(stripAnsi(stderr.trim() || stdout.trim() || `codex exec failed with code ${code ?? 'unknown'}`));
+  } finally {
+    void fs.unlink(messagePath).catch(() => {});
+    void fs.unlink(outputSchemaPath).catch(() => {});
   }
-
-  let text = '';
-  try {
-    text = (await fs.readFile(messagePath, 'utf8')).trim();
-  } catch {
-    text = '';
-  }
-  void fs.unlink(messagePath).catch(() => {});
-
-  if (!text && assistantText.trim()) {
-    text = assistantText.trim();
-  }
-
-  if (!text) {
-    throw new Error('codex exec returned empty output');
-  }
-
-  return {
-    text,
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens
-  };
 };

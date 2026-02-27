@@ -3,6 +3,20 @@ type HistoryMessage = {
   content: string;
 };
 
+export type OllamaToolCall = {
+  type: 'function';
+  function: {
+    name: string;
+    arguments: Record<string, unknown>;
+  };
+};
+
+export type OllamaToolMessage = {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+  toolCalls?: OllamaToolCall[];
+};
+
 type OllamaCompletionInput = {
   baseUrl?: string;
   model: string;
@@ -21,6 +35,30 @@ type OllamaCompletionResult = {
   outputTokens?: number;
 };
 
+type OllamaToolTurnInput = {
+  baseUrl?: string;
+  model: string;
+  messages: OllamaToolMessage[];
+  tools: Array<{
+    type: 'function';
+    function: {
+      name: string;
+      description?: string;
+      parameters: Record<string, unknown>;
+    };
+  }>;
+  signal?: AbortSignal;
+};
+
+type OllamaToolTurnResult = {
+  text: string;
+  model: string;
+  toolCalls: OllamaToolCall[];
+  assistantMessage: OllamaToolMessage;
+  inputTokens?: number;
+  outputTokens?: number;
+};
+
 const DEFAULT_OLLAMA_BASE_URL = 'http://127.0.0.1:11434';
 
 const mapRole = (role: HistoryMessage['role']): 'system' | 'user' | 'assistant' => {
@@ -30,6 +68,8 @@ const mapRole = (role: HistoryMessage['role']): 'system' | 'user' | 'assistant' 
 
   return role;
 };
+
+const mapRoleForTools = (role: HistoryMessage['role']): 'system' | 'user' | 'assistant' | 'tool' => role;
 
 const normalizeBaseUrl = (value?: string): string => {
   const raw = value?.trim() || DEFAULT_OLLAMA_BASE_URL;
@@ -303,6 +343,136 @@ export const createOllamaCompletion = async (input: OllamaCompletionInput): Prom
   return {
     text: fullText,
     model,
+    inputTokens,
+    outputTokens
+  };
+};
+
+const parseToolCallArguments = (value: unknown): Record<string, unknown> => {
+  if (!value) {
+    return {};
+  }
+
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return {};
+    }
+
+    return {};
+  }
+
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+
+  return {};
+};
+
+const normalizeToolCalls = (value: unknown): OllamaToolCall[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const normalized: OllamaToolCall[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object') {
+      continue;
+    }
+
+    const entry = raw as { type?: unknown; function?: { name?: unknown; arguments?: unknown } };
+    const name = typeof entry.function?.name === 'string' ? entry.function.name.trim() : '';
+    if (!name) {
+      continue;
+    }
+
+    normalized.push({
+      type: 'function',
+      function: {
+        name,
+        arguments: parseToolCallArguments(entry.function?.arguments)
+      }
+    });
+  }
+
+  return normalized;
+};
+
+export const createOllamaToolTurn = async (input: OllamaToolTurnInput): Promise<OllamaToolTurnResult> => {
+  const resolvedBase = normalizeBaseUrl(input.baseUrl);
+  let res: Response;
+
+  try {
+    res = await fetch(makeOllamaUrl(resolvedBase, '/api/chat'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      signal: input.signal,
+      body: JSON.stringify({
+        model: input.model,
+        stream: false,
+        messages: input.messages.map((message) => ({
+          role: mapRoleForTools(message.role),
+          content: message.content,
+          ...(message.toolCalls ? { tool_calls: message.toolCalls } : {})
+        })),
+        tools: input.tools
+      })
+    });
+  } catch (error) {
+    throw new Error(asErrorMessage(error));
+  }
+
+  if (!res.ok) {
+    throw new Error(await parseConnectionError(res));
+  }
+
+  const payload = (await res.json().catch(() => null)) as
+    | {
+        error?: unknown;
+        model?: unknown;
+        message?: {
+          role?: unknown;
+          content?: unknown;
+          tool_calls?: unknown;
+        };
+        prompt_eval_count?: unknown;
+        eval_count?: unknown;
+      }
+    | null;
+
+  if (typeof payload?.error === 'string' && payload.error.trim()) {
+    throw new Error(payload.error);
+  }
+
+  const model = typeof payload?.model === 'string' && payload.model.trim() ? payload.model : input.model;
+  const text = typeof payload?.message?.content === 'string' ? payload.message.content : '';
+  const toolCalls = normalizeToolCalls(payload?.message?.tool_calls);
+  const inputTokens =
+    typeof payload?.prompt_eval_count === 'number' && Number.isFinite(payload.prompt_eval_count)
+      ? payload.prompt_eval_count
+      : undefined;
+  const outputTokens =
+    typeof payload?.eval_count === 'number' && Number.isFinite(payload.eval_count)
+      ? payload.eval_count
+      : undefined;
+
+  const assistantMessage: OllamaToolMessage = {
+    role: 'assistant',
+    content: text,
+    ...(toolCalls.length > 0 ? { toolCalls } : {})
+  };
+
+  return {
+    text,
+    model,
+    toolCalls,
+    assistantMessage,
     inputTokens,
     outputTokens
   };

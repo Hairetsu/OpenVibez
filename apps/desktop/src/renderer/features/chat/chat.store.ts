@@ -14,6 +14,7 @@ import type {
 import { api } from '../../shared/api/client';
 
 export type StreamTimelineEntry =
+  | { type: 'run_marker'; runId: string }
   | { type: 'trace'; trace: MessageStreamTrace }
   | { type: 'text'; content: string };
 
@@ -154,7 +155,11 @@ const asTimelineEntry = (value: unknown): StreamTimelineEntry | null => {
     return null;
   }
 
-  const item = value as { type?: unknown; trace?: unknown; content?: unknown };
+  const item = value as { type?: unknown; runId?: unknown; trace?: unknown; content?: unknown };
+  if (item.type === 'run_marker' && typeof item.runId === 'string' && item.runId.trim()) {
+    return { type: 'run_marker', runId: item.runId.trim() };
+  }
+
   if (item.type === 'text' && typeof item.content === 'string') {
     return { type: 'text', content: item.content };
   }
@@ -533,6 +538,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     const streamId = `stream_${nanoid(10)}`;
     const clientRequestId = `req_${nanoid(12)}`;
+    const runMarker: StreamTimelineEntry = { type: 'run_marker', runId: clientRequestId };
     const optimisticUserMessageId = `tmp_user_${clientRequestId}`;
     const optimisticUserMessage: Message = {
       id: optimisticUserMessageId,
@@ -550,18 +556,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
     };
 
     set((state) => ({
+      sessionTimelineById: {
+        ...state.sessionTimelineById,
+        [activeSessionId]: [...(state.sessionTimelineById[activeSessionId] ?? []), runMarker]
+      },
       messages:
         state.selectedSessionId === activeSessionId
           ? [...state.messages, optimisticUserMessage]
           : state.messages,
-      sessionTracesById: {
-        ...state.sessionTracesById,
-        [activeSessionId]: []
-      },
-      sessionTimelineById: {
-        ...state.sessionTimelineById,
-        [activeSessionId]: []
-      },
+      sessionTracesById: state.sessionTracesById,
       sessionStatusesById: {
         ...state.sessionStatusesById,
         [activeSessionId]: ['Starting...']
@@ -571,8 +574,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         streamId,
         sessionId: activeSessionId,
         text: '',
-        traces: [],
-        timeline: [],
+        traces: state.sessionTracesById[activeSessionId] ?? [],
+        timeline: [...(state.sessionTimelineById[activeSessionId] ?? []), runMarker],
         status: 'Starting...',
         statusTrail: ['Starting...']
       }

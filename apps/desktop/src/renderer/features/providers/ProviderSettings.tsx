@@ -1,11 +1,13 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import type { ModelProfile, Provider, ProviderSubscriptionLoginState } from '../../../preload/types';
+import { api } from '../../shared/api/client';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Textarea } from '@/components/ui/textarea';
 
 type ProviderSettingsProps = {
   providers: Provider[];
@@ -22,6 +24,7 @@ type ProviderSettingsProps = {
 const CHATGPT_SUBSCRIPTION_URL = 'https://chatgpt.com';
 const OPENAI_API_BILLING_URL = 'https://platform.openai.com/settings/organization/billing/overview';
 const DEFAULT_OLLAMA_ENDPOINT = 'http://127.0.0.1:11434';
+type CodexApprovalPolicy = 'untrusted' | 'on-failure' | 'on-request' | 'never';
 
 const formatSuccessMessage = (models?: ModelProfile[]): string => {
   const count = models?.length ?? 0;
@@ -46,6 +49,8 @@ export const ProviderSettings = ({
   const [newProviderType, setNewProviderType] = useState<Provider['type']>('openai');
   const [newAuthKind, setNewAuthKind] = useState<Provider['authKind']>('api_key');
   const [subscriptionState, setSubscriptionState] = useState<ProviderSubscriptionLoginState | null>(null);
+  const [codexApprovalPolicy, setCodexApprovalPolicy] = useState<CodexApprovalPolicy>('on-request');
+  const [codexOutputSchema, setCodexOutputSchema] = useState('');
 
   useEffect(() => {
     if (newProviderType === 'local') {
@@ -72,6 +77,31 @@ export const ProviderSettings = ({
     () => providers.find((provider) => provider.id === resolvedActiveProviderId) ?? null,
     [providers, resolvedActiveProviderId]
   );
+
+  useEffect(() => {
+    const loadCodexConfig = async () => {
+      if (!activeProvider || activeProvider.type !== 'openai' || activeProvider.authKind !== 'oauth_subscription') {
+        return;
+      }
+
+      const [approval, schema] = await Promise.all([
+        api.settings.get({ key: 'codex_approval_policy' }),
+        api.settings.get({ key: 'codex_output_schema_json' })
+      ]);
+
+      if (approval === 'untrusted' || approval === 'on-failure' || approval === 'on-request' || approval === 'never') {
+        setCodexApprovalPolicy(approval);
+      }
+
+      if (typeof schema === 'string') {
+        setCodexOutputSchema(schema);
+      } else {
+        setCodexOutputSchema('');
+      }
+    };
+
+    void loadCodexConfig();
+  }, [activeProvider]);
 
   const onCreate = async () => {
     if (!newProviderName.trim()) return;
@@ -142,6 +172,28 @@ export const ProviderSettings = ({
       return;
     }
     if (next.message) setStatus(next.message);
+  };
+
+  const onSaveCodexControls = async () => {
+    if (codexOutputSchema.trim()) {
+      try {
+        const parsed = JSON.parse(codexOutputSchema);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          setStatus('Schema must be a JSON object.');
+          return;
+        }
+      } catch {
+        setStatus('Schema must be valid JSON.');
+        return;
+      }
+    }
+
+    await Promise.all([
+      api.settings.set({ key: 'codex_approval_policy', value: codexApprovalPolicy }),
+      api.settings.set({ key: 'codex_output_schema_json', value: codexOutputSchema.trim() })
+    ]);
+
+    setStatus('Saved Codex execution controls.');
   };
 
   return (
@@ -247,6 +299,35 @@ export const ProviderSettings = ({
             <div className="flex gap-2">
               <Button size="sm" variant="ghost" type="button" onClick={() => void onOpenExternal(CHATGPT_SUBSCRIPTION_URL)}>Open ChatGPT</Button>
               <Button size="sm" variant="ghost" type="button" onClick={() => void onOpenExternal(OPENAI_API_BILLING_URL)}>API Billing</Button>
+            </div>
+
+            <div className="grid gap-2 rounded-md border border-border/40 bg-background/30 p-2.5">
+              <Label className="text-[11px]">Codex approval policy</Label>
+              <Select
+                value={codexApprovalPolicy}
+                onValueChange={(value) => setCodexApprovalPolicy(value as CodexApprovalPolicy)}
+              >
+                <SelectTrigger className="h-8"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="untrusted">untrusted</SelectItem>
+                  <SelectItem value="on-failure">on-failure</SelectItem>
+                  <SelectItem value="on-request">on-request</SelectItem>
+                  <SelectItem value="never">never</SelectItem>
+                </SelectContent>
+              </Select>
+
+              <Label className="text-[11px]">Output schema JSON (optional)</Label>
+              <Textarea
+                value={codexOutputSchema}
+                onChange={(e) => setCodexOutputSchema(e.target.value)}
+                placeholder='{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}'
+                className="min-h-[84px] font-mono text-[11px]"
+              />
+              <div className="flex justify-end">
+                <Button size="sm" variant="outline" type="button" onClick={() => void onSaveCodexControls()}>
+                  Save Codex Controls
+                </Button>
+              </div>
             </div>
           </div>
         )}
