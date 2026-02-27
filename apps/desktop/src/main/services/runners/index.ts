@@ -1,3 +1,4 @@
+export { runAnthropic } from './anthropicRunner';
 export { runCodexSubscription } from './codexRunner';
 export { runLocalOllama } from './localOllamaRunner';
 export { runOpenAI } from './openaiRunner';

@@ -24,11 +24,12 @@ import {
   setSessionProvider
 } from '../services/db';
 import { getSecret } from '../services/keychain';
+import { createAnthropicCompletion } from '../services/providers/anthropic';
 import { createCodexCompletion } from '../services/providers/codex';
 import { createOllamaCompletion } from '../services/providers/ollama';
 import { createOpenAICompletion, getOpenAIBackgroundJobKind } from '../services/providers/openai';
-import { resolveOllamaModel, resolveOpenAIModel } from '../services/runners/models';
-import { runCodexSubscription, runLocalOllama, runOpenAI } from '../services/runners';
+import { resolveAnthropicModel, resolveOllamaModel, resolveOpenAIModel } from '../services/runners/models';
+import { runAnthropic, runCodexSubscription, runLocalOllama, runOpenAI } from '../services/runners';
 import type { ProviderRunner, RunnerContext, RunnerEvent } from '../services/runners';
 import { logger } from '../util/logger';
 import {
@@ -94,6 +95,7 @@ const HISTORY_WINDOW = 30;
 const SESSION_TITLE_MAX_LENGTH = 80;
 const SESSION_TITLE_TEXT_WINDOW = 1000;
 const SESSION_TITLE_PLACEHOLDER = /^(new vibe session|new session|session\s+\d{1,2}:\d{2}(:\d{2})?\s*(am|pm)?)$/i;
+const openAIBaseUrlSettingKey = (providerId: string): string => `provider_openai_base_url:${providerId}`;
 
 class RequestCancelledError extends Error {
   constructor(message = 'Request cancelled by user.') {
@@ -255,8 +257,12 @@ const generateSessionTitle = async (input: {
       return null;
     }
 
+    const baseUrlRaw = getSetting(openAIBaseUrlSettingKey(provider.id));
+    const baseUrl = typeof baseUrlRaw === 'string' && baseUrlRaw.trim() ? baseUrlRaw.trim() : undefined;
+
     const completion = await createOpenAICompletion({
       apiKey: secret,
+      baseUrl,
       model: resolveOpenAIModel(input.modelProfileId, input.requestedModelId),
       history,
       temperature: 0.2,
@@ -283,6 +289,24 @@ const generateSessionTitle = async (input: {
     return title || null;
   }
 
+  if (provider.type === 'anthropic') {
+    if (!secret) {
+      return null;
+    }
+
+    const completion = await createAnthropicCompletion({
+      apiKey: secret,
+      model: resolveAnthropicModel(input.modelProfileId, input.requestedModelId),
+      history,
+      temperature: 0.2,
+      maxOutputTokens: 24,
+      signal: input.signal
+    });
+
+    const title = sanitizeSessionTitle(completion.text);
+    return title || null;
+  }
+
   return null;
 };
 
@@ -293,6 +317,10 @@ const runnerForProvider = (input: { providerType: string; authKind: string }): P
 
   if (input.providerType === 'openai') {
     return runOpenAI;
+  }
+
+  if (input.providerType === 'anthropic') {
+    return runAnthropic;
   }
 
   if (input.providerType === 'local') {
@@ -363,16 +391,20 @@ const resolveCodexOptions = (): RunnerContext['codexOptions'] => {
   };
 };
 
-const resolveOpenAIOptions = (): RunnerContext['openaiOptions'] => {
+const resolveOpenAIOptions = (providerId: string): RunnerContext['openaiOptions'] => {
   const backgroundModeEnabled = getSetting('openai_background_mode_enabled') === true;
   const pollRaw = getSetting('openai_background_poll_interval_ms');
+  const baseUrlRaw = getSetting(openAIBaseUrlSettingKey(providerId));
 
   const backgroundPollIntervalMs =
     typeof pollRaw === 'number' && Number.isFinite(pollRaw) && pollRaw >= 500
       ? Math.trunc(pollRaw)
       : undefined;
 
+  const baseUrl = typeof baseUrlRaw === 'string' && baseUrlRaw.trim() ? baseUrlRaw.trim() : undefined;
+
   return {
+    baseUrl,
     backgroundModeEnabled,
     backgroundPollIntervalMs
   };
@@ -656,7 +688,7 @@ export const registerChatHandlers = (): void => {
         history,
         accessMode: effectiveAccessMode,
         workspace,
-        openaiOptions: resolveOpenAIOptions(),
+        openaiOptions: resolveOpenAIOptions(provider.id),
         codexOptions: resolveCodexOptions(),
         signal: controller.signal,
         onEvent: (runnerEvent) => {

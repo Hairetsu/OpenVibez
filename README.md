@@ -7,7 +7,7 @@ OpenVibez gives you a native chat interface that connects to the AI providers yo
 ![Chat View](docs/screenshots/chat-empty.png)
 ![Settings](docs/screenshots/settings.png)
 
-> **Status:** Early alpha. Core chat loop works with OpenAI API keys, ChatGPT subscriptions, and local Ollama models, including autonomous local CLI execution and cancellable runs.
+> **Status:** Early alpha. Core chat loop works with OpenAI API keys, ChatGPT subscriptions, Anthropic API keys, and local Ollama models, including autonomous local CLI execution and cancellable runs.
 
 > [!WARNING]
 > **This is very early alpha software.** I've directed the vision, but fully embraced the vibes while building it — and it shows. OpenVibez has direct CLI access and can be given root execution privileges. **I take zero responsibility** for what happens if you hand it the keys to your system. This is a fun experiment, not production software. Use at your own risk.
@@ -39,7 +39,7 @@ openvibez/
 └── packages/shared/       # Shared types and utilities
 ```
 
-**Main process** handles all sensitive operations — keychain access, database queries, API calls to providers, and subprocess management for Codex CLI integration. The renderer never touches secrets or makes network requests directly.
+**Main process** handles all sensitive operations — keychain access, database queries, provider runner orchestration, API calls, and subprocess management for Codex CLI integration. The renderer never touches secrets or makes network requests directly.
 
 **Renderer** is a React SPA with Zustand for state, Radix UI primitives, and Tailwind CSS. Communication with main happens exclusively through typed IPC channels exposed via `contextBridge`.
 
@@ -72,11 +72,12 @@ npm run db:studio
 ### Connect a provider
 
 1. Launch the app and go to **Settings**
-2. Add a provider (OpenAI API Key, ChatGPT Subscription, or Local/Ollama)
-3. For OpenAI API key: paste your key, hit **Save + Test**
+2. Add a provider (OpenAI API Key, ChatGPT Subscription, Anthropic API Key, or Local/Ollama)
+3. For OpenAI-compatible APIs (OpenAI, OpenRouter, Gemini-compatible, custom): paste key, optionally set API base URL, hit **Save + Test**
 4. For subscription: click **Connect ChatGPT** and complete the device login flow
-5. For Ollama: select **Local (Ollama)** and use **Test Default** (or save a custom endpoint URL)
-6. Models sync automatically on successful connection
+5. For Anthropic: paste key and hit **Save + Test**
+6. For Ollama: select **Local (Ollama)** and use **Test Default** (or save a custom endpoint URL)
+7. Models sync automatically on successful connection
 
 ### Environment variables
 
@@ -87,64 +88,25 @@ npm run db:studio
 
 ---
 
-## Robustness Program (Phases 1-3)
-
-The roadmap in [docs/ROBUSTNESS_PROPOSALS.md](docs/ROBUSTNESS_PROPOSALS.md) is now implemented through Phase 3.
-
-### Phase 1 (core reliability)
-
-- **Provider runner split** — chat orchestration now routes through a stable runner contract (`OpenAI`, `Codex`, `Local/Ollama`) instead of one monolithic provider loop.
-- **OpenAI SDK-first path** — OpenAI completions use official SDK event handling for streaming and usage capture.
-- **Hard command policy enforcement** — shell calls are guarded by workspace trust + access mode rules (scoped cwd enforcement, read-only mutation blocking, root restricted to trusted workspaces).
-- **Idempotent send/run flow** — `clientRequestId` + `assistant_runs` uniqueness prevent duplicate user/assistant rows during retries and races.
-
-### Phase 2 (durability + provider controls)
-
-- **Durable run journal** — `assistant_runs` lifecycle and recovery flow handle restart reconciliation for interrupted runs.
-- **Codex execution controls** — approval policy and optional JSON output schema are configurable and enforced in Codex execution.
-- **Ollama native tools-first execution** — native tool calling is attempted first, with protocol fallback retained for weaker local models.
-- **Trace/event normalization** — provider traces and streamed deltas map consistently into the shared timeline feed.
-
-### Phase 3 (flagged pilots)
-
-- **OpenAI background mode pilot** — optional background response execution with persisted `background_jobs` state and polling recovery.
-- **Background scheduler** — main-process scheduler resumes/finishes active OpenAI background jobs after restarts.
-- **Codex SDK pilot** — optional SDK path is available behind a setting, with CLI integration kept as default fallback.
-- **Webhook verification helper** — OpenAI webhook unwrap helper is included for signature-verified event ingestion paths.
-
-### Operational notes
-
-- OpenAI background mode and Codex SDK pilot are opt-in in Provider Settings.
-- Default behavior remains conservative: OpenAI streaming and Codex CLI paths stay available as fallback.
-
----
-
 ## What's Built
 
 - [x] Electron shell with frameless macOS title bar and native drag region
 - [x] Provider management — create, configure, test connections
 - [x] API key auth with OS keychain storage (keytar)
-- [x] ChatGPT subscription auth via Codex CLI device login
-- [x] Local model support via Ollama (default `http://127.0.0.1:11434`)
-- [x] Local CLI tool execution loop (`run_shell`) with multi-step autonomous task completion
-- [x] Ollama native tool-calling path with protocol fallback
-- [x] Plan/checklist enforcement for local agent runs
-- [x] Model discovery — auto-sync available models from provider
+- [x] Multi-provider chat support: OpenAI API, ChatGPT subscription (Codex), Anthropic API, and local Ollama
+- [x] OpenAI-compatible endpoint mode (base URL override) for OpenRouter, Gemini-compatible API, and custom endpoints
+- [x] Model discovery and sync per provider
 - [x] Session management — create, switch, persist conversations
 - [x] Streaming chat with real-time text deltas
 - [x] Trace visualization — thought, plan, and action traces during execution (inline in message feed)
-- [x] Cancel in-flight requests (OpenAI, Codex, and local/Ollama)
-- [x] Provider runner architecture (`OpenAI`, `Codex`, `Local/Ollama`)
-- [x] Command policy enforcement for workspace trust/access modes
-- [x] Send idempotency via `clientRequestId` + durable `assistant_runs`
-- [x] Restart recovery for interrupted runs
+- [x] Cancellable in-flight requests across providers
 - [x] Workspace scoping — attach project directories, control execution sandbox
-- [x] Scoped vs root execution modes
+- [x] Scoped/root execution modes with command policy enforcement by workspace trust
 - [x] Token usage tracking with 30-day cost summary
-- [x] SQLite persistence for all data (Drizzle ORM)
-- [x] OpenAI background jobs (`background_jobs`) + scheduler recovery
+- [x] Durable run persistence and restart recovery for interrupted tasks
+- [x] SQLite persistence for sessions, messages, usage, settings, and background jobs
 - [x] Codex approval policy + output schema controls
-- [x] Codex SDK pilot toggle (CLI fallback retained)
+- [x] Optional OpenAI background mode and Codex SDK pilot (both remain opt-in)
 
 ---
 
@@ -152,13 +114,19 @@ The roadmap in [docs/ROBUSTNESS_PROPOSALS.md](docs/ROBUSTNESS_PROPOSALS.md) is n
 
 ### Multi-Provider Support
 
-The type system already supports `openai | anthropic | local` provider types. Next up:
+Current baseline:
 
-- **Anthropic / Claude** — Direct API integration with Claude 4 family models. Same key-in-keychain pattern as OpenAI.
-- **Google Gemini** — API key auth, model sync, streaming completions.
-- **OpenRouter** — Single key, access to 100+ models from every major provider.
-- **Advanced Local / Ollama** — richer local runtime controls (per-provider endpoint presets, model options, and diagnostics).
-- **Custom OpenAI-compatible** — Any endpoint that speaks the OpenAI chat completions API (LM Studio, vLLM, text-generation-webui, etc.)
+- **OpenAI** (API key + subscription via Codex)
+- **Anthropic / Claude** (API key)
+- **Local Ollama**
+- **OpenAI-compatible endpoints** via base URL override (OpenRouter, Gemini-compatible API, custom providers)
+
+Next up:
+
+- **Gemini native integration** — direct provider path (not compatibility mode) with dedicated model and error handling.
+- **OpenRouter first-class mode** — provider-specific headers, clearer model defaults, and usage/cost attribution.
+- **Advanced Local / Ollama** — richer runtime controls (provider presets, model options, diagnostics).
+- **Custom OpenAI-compatible profiles** — named endpoint profiles, per-endpoint defaults, and validation UX.
 
 ### Agent Capabilities
 

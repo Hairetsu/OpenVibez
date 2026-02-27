@@ -14,6 +14,7 @@ type HistoryMessage = {
 
 type OpenAICompletionInput = {
   apiKey: string;
+  baseUrl?: string;
   providerId?: string;
   model: string;
   history: HistoryMessage[];
@@ -74,6 +75,16 @@ class OpenAIBackgroundUnsupportedError extends Error {
 }
 
 const mapRole = (role: HistoryMessage['role']): 'system' | 'user' | 'assistant' => {
+  if (role === 'tool') {
+    return 'assistant';
+  }
+
+  return role;
+};
+
+const mapRoleForChatCompletions = (
+  role: HistoryMessage['role']
+): 'system' | 'user' | 'assistant' => {
   if (role === 'tool') {
     return 'assistant';
   }
@@ -191,10 +202,43 @@ const sleepWithSignal = async (ms: number, signal?: AbortSignal): Promise<void> 
   });
 };
 
-const createClient = (apiKey: string, webhookSecret?: string | null): OpenAI => {
+const normalizeBaseUrl = (value?: string): string | undefined => {
+  const raw = value?.trim();
+  if (!raw) {
+    return undefined;
+  }
+
+  const withProtocol = /^[a-z]+:\/\//i.test(raw) ? raw : `https://${raw}`;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(withProtocol);
+  } catch {
+    throw new Error(`Invalid OpenAI-compatible base URL: "${raw}"`);
+  }
+
+  return parsed.toString().replace(/\/$/, '');
+};
+
+const isOfficialOpenAIBaseUrl = (baseUrl?: string): boolean => {
+  if (!baseUrl) {
+    return true;
+  }
+
+  try {
+    const parsed = new URL(baseUrl);
+    return parsed.hostname === 'api.openai.com';
+  } catch {
+    return false;
+  }
+};
+
+const createClient = (apiKey: string, options?: { webhookSecret?: string | null; baseUrl?: string }): OpenAI => {
+  const normalizedBaseUrl = normalizeBaseUrl(options?.baseUrl);
   return new OpenAI({
     apiKey,
-    webhookSecret: webhookSecret ?? null,
+    webhookSecret: options?.webhookSecret ?? null,
+    ...(normalizedBaseUrl ? { baseURL: normalizedBaseUrl } : {}),
     maxRetries: 2,
     timeout: 60_000
   });
@@ -276,10 +320,11 @@ export const isOpenAITerminalStatus = (status?: ResponseStatus): boolean => isTe
 
 export const retrieveOpenAIBackgroundResponse = async (input: {
   apiKey: string;
+  baseUrl?: string;
   responseId: string;
   signal?: AbortSignal;
 }): Promise<OpenAIBackgroundResponseSnapshot> => {
-  const client = createClient(input.apiKey);
+  const client = createClient(input.apiKey, { baseUrl: input.baseUrl });
   const response = await client.responses
     .retrieve(input.responseId, undefined, { signal: input.signal })
     .catch((error) => {
@@ -292,7 +337,7 @@ export const retrieveOpenAIBackgroundResponse = async (input: {
 const runOpenAIStreaming = async (input: OpenAICompletionInput): Promise<OpenAICompletionResult> => {
   input.onEvent?.({ type: 'status', text: 'Streaming response...' });
 
-  const client = createClient(input.apiKey);
+  const client = createClient(input.apiKey, { baseUrl: input.baseUrl });
   const baseRequest = createRequestBody(input);
 
   let fullText = '';
@@ -373,10 +418,88 @@ const runOpenAIStreaming = async (input: OpenAICompletionInput): Promise<OpenAIC
   };
 };
 
+const runOpenAICompatibleChatStreaming = async (input: OpenAICompletionInput): Promise<OpenAICompletionResult> => {
+  input.onEvent?.({ type: 'status', text: 'Streaming response...' });
+
+  const client = createClient(input.apiKey, { baseUrl: input.baseUrl });
+  const messages = input.history.map((message) => ({
+    role: mapRoleForChatCompletions(message.role),
+    content: message.content
+  }));
+
+  let fullText = '';
+  let model = input.model;
+  let inputTokens: number | undefined;
+  let outputTokens: number | undefined;
+
+  const stream = await client.chat.completions
+    .create(
+      {
+        model: input.model,
+        messages,
+        ...(typeof input.temperature === 'number' ? { temperature: input.temperature } : {}),
+        ...(typeof input.maxOutputTokens === 'number' ? { max_tokens: input.maxOutputTokens } : {}),
+        stream: true
+      },
+      { signal: input.signal }
+    )
+    .catch((error) => {
+      throw new Error(asErrorMessage(error));
+    });
+
+  for await (const event of stream) {
+    const delta = event.choices[0]?.delta?.content;
+    if (typeof delta === 'string' && delta.length > 0) {
+      fullText += delta;
+      input.onEvent?.({ type: 'assistant_delta', delta });
+    }
+  }
+
+  if (!fullText.trim()) {
+    const fallback = await client.chat.completions
+      .create(
+        {
+          model: input.model,
+          messages,
+          ...(typeof input.temperature === 'number' ? { temperature: input.temperature } : {}),
+          ...(typeof input.maxOutputTokens === 'number' ? { max_tokens: input.maxOutputTokens } : {}),
+          stream: false
+        },
+        {
+          signal: input.signal
+        }
+      )
+      .catch((error) => {
+        throw new Error(asErrorMessage(error));
+      });
+
+    model = typeof fallback.model === 'string' && fallback.model.trim() ? fallback.model : input.model;
+    fullText = (fallback.choices ?? [])
+      .map((choice) => (typeof choice.message?.content === 'string' ? choice.message.content : ''))
+      .filter((value) => value.length > 0)
+      .join('\n')
+      .trim();
+
+    inputTokens = toFiniteNumber(fallback.usage?.prompt_tokens);
+    outputTokens = toFiniteNumber(fallback.usage?.completion_tokens);
+  }
+
+  if (!fullText.trim()) {
+    throw new Error('OpenAI-compatible endpoint returned an empty response.');
+  }
+
+  return {
+    text: fullText,
+    model,
+    inputTokens,
+    outputTokens
+  };
+};
+
 const runOpenAIBackground = async (input: OpenAICompletionInput): Promise<OpenAICompletionResult> => {
   input.onEvent?.({ type: 'status', text: 'Queued in background...' });
 
-  const client = createClient(input.apiKey);
+  const client = createClient(input.apiKey, { baseUrl: input.baseUrl });
   const baseRequest = createRequestBody(input);
   const pollIntervalMs = Math.max(500, Math.trunc(input.backgroundPollIntervalMs ?? DEFAULT_BACKGROUND_POLL_INTERVAL_MS));
 
@@ -462,6 +585,7 @@ const runOpenAIBackground = async (input: OpenAICompletionInput): Promise<OpenAI
       throwIfAborted(input.signal);
       snapshot = await retrieveOpenAIBackgroundResponse({
         apiKey: input.apiKey,
+        baseUrl: input.baseUrl,
         responseId: snapshot.responseId,
         signal: input.signal
       });
@@ -522,6 +646,14 @@ const runOpenAIBackground = async (input: OpenAICompletionInput): Promise<OpenAI
 };
 
 export const createOpenAICompletion = async (input: OpenAICompletionInput): Promise<OpenAICompletionResult> => {
+  if (!isOfficialOpenAIBaseUrl(input.baseUrl)) {
+    input.onEvent?.({
+      type: 'status',
+      text: 'Using OpenAI-compatible endpoint...'
+    });
+    return runOpenAICompatibleChatStreaming(input);
+  }
+
   if (input.backgroundModeEnabled) {
     try {
       return await runOpenAIBackground(input);
@@ -541,8 +673,11 @@ export const createOpenAICompletion = async (input: OpenAICompletionInput): Prom
   return runOpenAIStreaming(input);
 };
 
-export const testOpenAIConnection = async (apiKey: string): Promise<{ ok: boolean; status: number }> => {
-  const client = createClient(apiKey);
+export const testOpenAIConnection = async (
+  apiKey: string,
+  baseUrl?: string
+): Promise<{ ok: boolean; status: number }> => {
+  const client = createClient(apiKey, { baseUrl });
 
   try {
     await client.models.list();
@@ -567,8 +702,8 @@ export const testOpenAIConnection = async (apiKey: string): Promise<{ ok: boolea
 
 const isUsefulModelId = (modelId: string): boolean => /^(gpt|o\d|codex)/i.test(modelId);
 
-export const listOpenAIModels = async (apiKey: string): Promise<string[]> => {
-  const client = createClient(apiKey);
+export const listOpenAIModels = async (apiKey: string, baseUrl?: string): Promise<string[]> => {
+  const client = createClient(apiKey, { baseUrl });
 
   const page = await client.models.list().catch((error) => {
     throw new Error(asErrorMessage(error));
@@ -576,7 +711,17 @@ export const listOpenAIModels = async (apiKey: string): Promise<string[]> => {
 
   const modelIds = page.data
     .map((entry) => (typeof entry.id === 'string' ? entry.id : ''))
-    .filter((modelId) => modelId.length > 0 && isUsefulModelId(modelId));
+    .filter((modelId) => {
+      if (modelId.length === 0) {
+        return false;
+      }
+
+      if (!isOfficialOpenAIBaseUrl(baseUrl)) {
+        return true;
+      }
+
+      return isUsefulModelId(modelId);
+    });
 
   return [...new Set(modelIds)].sort((a, b) => a.localeCompare(b));
 };
@@ -591,7 +736,7 @@ export const unwrapOpenAIWebhookEvent = async (input: {
   responseId?: string;
   createdAt?: number;
 }> => {
-  const client = createClient(input.apiKey, input.webhookSecret);
+  const client = createClient(input.apiKey, { webhookSecret: input.webhookSecret });
   const event = await client.webhooks.unwrap(input.payload, input.headers, input.webhookSecret);
   const normalized = event as { type?: unknown; created_at?: unknown; data?: { id?: unknown } };
 

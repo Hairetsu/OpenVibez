@@ -24,6 +24,9 @@ type ProviderSettingsProps = {
 const CHATGPT_SUBSCRIPTION_URL = 'https://chatgpt.com';
 const OPENAI_API_BILLING_URL = 'https://platform.openai.com/settings/organization/billing/overview';
 const DEFAULT_OLLAMA_ENDPOINT = 'http://127.0.0.1:11434';
+const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+const GEMINI_OPENAI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai';
+const openAIBaseUrlSettingKey = (providerId: string): string => `provider_openai_base_url:${providerId}`;
 type CodexApprovalPolicy = 'untrusted' | 'on-failure' | 'on-request' | 'never';
 
 const formatSuccessMessage = (models?: ModelProfile[]): string => {
@@ -52,21 +55,25 @@ export const ProviderSettings = ({
   const [codexApprovalPolicy, setCodexApprovalPolicy] = useState<CodexApprovalPolicy>('on-request');
   const [codexOutputSchema, setCodexOutputSchema] = useState('');
   const [codexSdkPilotEnabled, setCodexSdkPilotEnabled] = useState(false);
+  const [openaiBaseUrl, setOpenaiBaseUrl] = useState('');
   const [openaiBackgroundModeEnabled, setOpenaiBackgroundModeEnabled] = useState(false);
   const [openaiBackgroundPollIntervalMs, setOpenaiBackgroundPollIntervalMs] = useState('2000');
 
   useEffect(() => {
-    if (newProviderType === 'local') {
+    if (newProviderType === 'local' || newProviderType === 'anthropic') {
       if (newAuthKind !== 'api_key') {
         setNewAuthKind('api_key');
       }
-      if (newProviderName === 'OpenAI Primary') {
+      if (newProviderType === 'local' && newProviderName === 'OpenAI Primary') {
         setNewProviderName('Local Ollama');
+      }
+      if (newProviderType === 'anthropic' && newProviderName === 'OpenAI Primary') {
+        setNewProviderName('Anthropic Primary');
       }
       return;
     }
 
-    if (newProviderType === 'openai' && newProviderName === 'Local Ollama') {
+    if (newProviderType === 'openai' && (newProviderName === 'Local Ollama' || newProviderName === 'Anthropic Primary')) {
       setNewProviderName('OpenAI Primary');
     }
   }, [newAuthKind, newProviderName, newProviderType]);
@@ -84,10 +91,12 @@ export const ProviderSettings = ({
   useEffect(() => {
     const loadProviderExecutionControls = async () => {
       if (!activeProvider || activeProvider.type !== 'openai') {
+        setOpenaiBaseUrl('');
         return;
       }
 
-      const [backgroundEnabled, backgroundPollInterval, approval, schema, sdkPilot] = await Promise.all([
+      const [baseUrlValue, backgroundEnabled, backgroundPollInterval, approval, schema, sdkPilot] = await Promise.all([
+        api.settings.get({ key: openAIBaseUrlSettingKey(activeProvider.id) }),
         api.settings.get({ key: 'openai_background_mode_enabled' }),
         api.settings.get({ key: 'openai_background_poll_interval_ms' }),
         api.settings.get({ key: 'codex_approval_policy' }),
@@ -95,6 +104,7 @@ export const ProviderSettings = ({
         api.settings.get({ key: 'codex_sdk_pilot_enabled' })
       ]);
 
+      setOpenaiBaseUrl(typeof baseUrlValue === 'string' ? baseUrlValue : '');
       setOpenaiBackgroundModeEnabled(backgroundEnabled === true);
       setOpenaiBackgroundPollIntervalMs(
         typeof backgroundPollInterval === 'number' && Number.isFinite(backgroundPollInterval)
@@ -123,7 +133,7 @@ export const ProviderSettings = ({
     await onCreateProvider({
       type: newProviderType,
       displayName: newProviderName.trim(),
-      authKind: newProviderType === 'local' ? 'api_key' : newAuthKind
+      authKind: newProviderType === 'openai' ? newAuthKind : 'api_key'
     });
     setStatus(`Created "${newProviderName.trim()}"`);
   };
@@ -213,6 +223,10 @@ export const ProviderSettings = ({
   };
 
   const onSaveOpenAIBackgroundControls = async () => {
+    if (!activeProvider || activeProvider.type !== 'openai') {
+      return;
+    }
+
     const trimmed = openaiBackgroundPollIntervalMs.trim();
     const parsedPoll = Number.parseInt(trimmed || '0', 10);
     if (!Number.isFinite(parsedPoll) || parsedPoll < 500) {
@@ -220,12 +234,14 @@ export const ProviderSettings = ({
       return;
     }
 
+    const trimmedBaseUrl = openaiBaseUrl.trim();
     await Promise.all([
+      api.settings.set({ key: openAIBaseUrlSettingKey(activeProvider.id), value: trimmedBaseUrl }),
       api.settings.set({ key: 'openai_background_mode_enabled', value: openaiBackgroundModeEnabled }),
       api.settings.set({ key: 'openai_background_poll_interval_ms', value: parsedPoll })
     ]);
 
-    setStatus('Saved OpenAI background controls.');
+    setStatus('Saved OpenAI provider controls.');
   };
 
   return (
@@ -243,6 +259,7 @@ export const ProviderSettings = ({
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="openai">OpenAI</SelectItem>
+                <SelectItem value="anthropic">Anthropic</SelectItem>
                 <SelectItem value="local">Local (Ollama)</SelectItem>
               </SelectContent>
             </Select>
@@ -250,7 +267,7 @@ export const ProviderSettings = ({
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="api_key">API Key</SelectItem>
-                {newProviderType !== 'local' && <SelectItem value="oauth_subscription">Subscription</SelectItem>}
+                {newProviderType === 'openai' && <SelectItem value="oauth_subscription">Subscription</SelectItem>}
               </SelectContent>
             </Select>
             <Button variant="outline" type="button" onClick={() => void onCreate()}>Add</Button>
@@ -373,8 +390,35 @@ export const ProviderSettings = ({
           </div>
         )}
 
-        {activeProvider?.type === 'openai' && (
+        {activeProvider?.type === 'openai' && activeProvider.authKind === 'api_key' && (
           <div className="grid gap-2 rounded-md border border-border/40 bg-background/30 p-2.5">
+            <Label className="text-[11px]">API base URL (optional)</Label>
+            <Input
+              value={openaiBaseUrl}
+              onChange={(e) => setOpenaiBaseUrl(e.target.value)}
+              placeholder="https://api.openai.com/v1"
+              className="h-8"
+            />
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" variant="outline" type="button" onClick={() => setOpenaiBaseUrl('')}>
+                OpenAI default
+              </Button>
+              <Button size="sm" variant="outline" type="button" onClick={() => setOpenaiBaseUrl(OPENROUTER_BASE_URL)}>
+                OpenRouter
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                type="button"
+                onClick={() => setOpenaiBaseUrl(GEMINI_OPENAI_BASE_URL)}
+              >
+                Gemini (OpenAI API)
+              </Button>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Configure OpenRouter or another OpenAI-compatible endpoint.
+            </p>
+
             <Label className="text-[11px]">OpenAI long-run background mode</Label>
             <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
               <input

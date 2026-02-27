@@ -13,6 +13,7 @@ export const runOpenAI: ProviderRunner = async (input) => {
 
   const completion = await createOpenAICompletion({
     apiKey: input.secret,
+    baseUrl: input.openaiOptions?.baseUrl,
     providerId: input.provider.id,
     model: resolveOpenAIModel(input.modelProfileId, input.requestedModelId),
     history: input.history,

@@ -36,6 +36,7 @@ export type RunnerContext = {
   accessMode: 'scoped' | 'root';
   workspace?: WorkspaceRow;
   openaiOptions?: {
+    baseUrl?: string;
     backgroundModeEnabled?: boolean;
     backgroundPollIntervalMs?: number;
   };

@@ -1,5 +1,13 @@
 import { ipcMain } from 'electron';
-import { createProvider, getProviderById, listModelProfilesByProvider, listProviders, replaceProviderModelProfiles } from '../services/db';
+import {
+  createProvider,
+  getProviderById,
+  getSetting,
+  listModelProfilesByProvider,
+  listProviders,
+  replaceProviderModelProfiles
+} from '../services/db';
+import { listAnthropicModels, testAnthropicConnection } from '../services/providers/anthropic';
 import { getSecret, removeSecret, setSecret } from '../services/keychain';
 import { getCodexDeviceAuthState, getCodexLoginStatus, listCodexAvailableModels, startCodexDeviceAuth } from '../services/providers/codex';
 import { listOllamaModels, testOllamaConnection } from '../services/providers/ollama';
@@ -50,20 +58,30 @@ const mapModelProfile = (row: {
   updatedAt: row.updated_at
 });
 
+const openAIBaseUrlSettingKey = (providerId: string): string => `provider_openai_base_url:${providerId}`;
+
 const syncModelsForProvider = async (
   provider: {
     id: string;
     type: string;
     auth_kind: string;
   },
-  secret?: string
+  secret?: string,
+  options?: {
+    openaiBaseUrl?: string;
+  }
 ) => {
   if (provider.type === 'openai') {
     const modelIds =
       provider.auth_kind === 'oauth_subscription'
         ? await listCodexAvailableModels()
-        : await listOpenAIModels(secret ?? '');
+        : await listOpenAIModels(secret ?? '', options?.openaiBaseUrl);
 
+    return replaceProviderModelProfiles(provider.id, modelIds).map(mapModelProfile);
+  }
+
+  if (provider.type === 'anthropic') {
+    const modelIds = await listAnthropicModels(secret ?? '');
     return replaceProviderModelProfiles(provider.id, modelIds).map(mapModelProfile);
   }
 
@@ -139,12 +157,31 @@ export const registerProviderHandlers = (): void => {
         return { ok: false, reason: 'No secret saved for provider' };
       }
 
-      const result = await testOpenAIConnection(secret);
-      const models = result.ok ? await syncModelsForProvider(provider, secret) : [];
+      const baseUrlRaw = getSetting(openAIBaseUrlSettingKey(provider.id));
+      const openaiBaseUrl = typeof baseUrlRaw === 'string' && baseUrlRaw.trim() ? baseUrlRaw.trim() : undefined;
+
+      const result = await testOpenAIConnection(secret, openaiBaseUrl);
+      const models = result.ok ? await syncModelsForProvider(provider, secret, { openaiBaseUrl }) : [];
       return {
         ok: result.ok,
         status: result.status,
         reason: result.ok ? undefined : 'OpenAI connectivity test failed',
+        models
+      };
+    }
+
+    if (provider.type === 'anthropic') {
+      const secret = await getSecret(provider.keychain_ref);
+      if (!secret) {
+        return { ok: false, reason: 'No secret saved for provider' };
+      }
+
+      const result = await testAnthropicConnection(secret);
+      const models = result.ok ? await syncModelsForProvider(provider, secret) : [];
+      return {
+        ok: result.ok,
+        status: result.status,
+        reason: result.reason,
         models
       };
     }
@@ -206,7 +243,14 @@ export const registerProviderHandlers = (): void => {
     if (provider.type === 'openai' && !secret) {
       throw new Error('No API key saved for this provider.');
     }
+    if (provider.type === 'anthropic' && !secret) {
+      throw new Error('No API key saved for this provider.');
+    }
 
-    return syncModelsForProvider(provider, secret ?? undefined);
+    const openaiBaseUrlRaw = provider.type === 'openai' ? getSetting(openAIBaseUrlSettingKey(provider.id)) : null;
+    const openaiBaseUrl =
+      typeof openaiBaseUrlRaw === 'string' && openaiBaseUrlRaw.trim() ? openaiBaseUrlRaw.trim() : undefined;
+
+    return syncModelsForProvider(provider, secret ?? undefined, { openaiBaseUrl });
   });
 };

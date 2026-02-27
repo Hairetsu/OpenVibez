@@ -1,6 +1,7 @@
 import { getModelProfileById, getSetting } from '../db';
 
 const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
+const DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-4-20250514';
 const DEFAULT_OLLAMA_MODEL = 'llama3.2:latest';
 
 export const resolveOpenAIModel = (modelProfileId: string | null, requestedModelId?: string): string => {
@@ -36,4 +37,19 @@ export const resolveOllamaModel = (modelProfileId: string | null, requestedModel
   }
 
   return DEFAULT_OLLAMA_MODEL;
+};
+
+export const resolveAnthropicModel = (modelProfileId: string | null, requestedModelId?: string): string => {
+  if (requestedModelId && requestedModelId.trim()) {
+    return requestedModelId;
+  }
+
+  if (modelProfileId) {
+    const profile = getModelProfileById(modelProfileId);
+    if (profile?.model_id) {
+      return profile.model_id;
+    }
+  }
+
+  return DEFAULT_ANTHROPIC_MODEL;
 };
