@@ -55,7 +55,7 @@ const mapHistoryToAnthropic = (history: HistoryMessage[]): {
   messages: Array<{ role: 'user' | 'assistant'; content: string }>;
 } => {
   const systemParts: string[] = [];
-  const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  const rawMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
 
   for (const entry of history) {
     const content = entry.content.trim();
@@ -68,13 +68,26 @@ const mapHistoryToAnthropic = (history: HistoryMessage[]): {
       continue;
     }
 
-    messages.push({
-      role: entry.role === 'user' ? 'user' : 'assistant',
+    rawMessages.push({
+      role: entry.role === 'assistant' ? 'assistant' : 'user',
       content
     });
   }
 
-  if (messages.length === 0) {
+  const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  for (const message of rawMessages) {
+    const previous = messages[messages.length - 1];
+    if (previous && previous.role === message.role) {
+      previous.content = `${previous.content}\n\n${message.content}`.trim();
+      continue;
+    }
+    messages.push(message);
+  }
+
+  if (messages.length === 0 || messages[0].role !== 'user') {
+    messages.unshift({ role: 'user', content: 'Continue.' });
+  }
+  if (messages[messages.length - 1]?.role !== 'user') {
     messages.push({ role: 'user', content: 'Continue.' });
   }
 
