@@ -1203,7 +1203,7 @@ export const ProviderSettings = ({
 
         {activeProvider?.type === "grok" && (
           <p className="text-[11px] text-muted-foreground">
-            Grok is wired as a native provider for direct chat completions. Local autonomous tool execution remains available via ChatGPT subscription mode and Local/Ollama agents.
+            Grok runs in autonomous tool mode using the same local command policy gates as other agents (workspace trust, scoped/root access, and high-risk command blocking).
           </p>
         )}
 

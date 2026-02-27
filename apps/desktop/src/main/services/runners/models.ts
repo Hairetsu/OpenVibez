@@ -74,7 +74,10 @@ export const resolveGeminiModel = (modelProfileId: string | null, requestedModel
 
 export const resolveGrokModel = (modelProfileId: string | null, requestedModelId?: string): string => {
   if (requestedModelId && requestedModelId.trim()) {
-    return requestedModelId;
+    const candidate = requestedModelId.trim();
+    if (/grok/i.test(candidate)) {
+      return candidate;
+    }
   }
 
   if (modelProfileId) {

@@ -150,6 +150,28 @@ const isActionKind = (value: unknown): value is MessageStreamTrace['actionKind']
   );
 };
 
+const PROTOCOL_NOISE_PATTERNS: RegExp[] = [
+  /^model\s+turn\s+\d+\s*:/i,
+  /(?:^|\s)(PLAN|TOOL_CALL|STEP_DONE|FINAL)\s*\{/i,
+  /^invalid protocol/i
+];
+
+const isProtocolNoiseText = (value: string): boolean => {
+  const normalized = value.trim();
+  if (!normalized) {
+    return false;
+  }
+  return PROTOCOL_NOISE_PATTERNS.some((pattern) => pattern.test(normalized));
+};
+
+const sanitizeTimelineText = (value: string): string => {
+  const lines = value
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => !isProtocolNoiseText(line));
+  return lines.join('\n').trim();
+};
+
 const asTimelineEntry = (value: unknown): StreamTimelineEntry | null => {
   if (!value || typeof value !== 'object') {
     return null;
@@ -161,7 +183,11 @@ const asTimelineEntry = (value: unknown): StreamTimelineEntry | null => {
   }
 
   if (item.type === 'text' && typeof item.content === 'string') {
-    return { type: 'text', content: item.content };
+    const content = sanitizeTimelineText(item.content);
+    if (!content) {
+      return null;
+    }
+    return { type: 'text', content };
   }
 
   if (item.type === 'trace' && item.trace && typeof item.trace === 'object') {
@@ -170,11 +196,16 @@ const asTimelineEntry = (value: unknown): StreamTimelineEntry | null => {
       (trace.traceKind === 'thought' || trace.traceKind === 'plan' || trace.traceKind === 'action') &&
       typeof trace.text === 'string'
     ) {
+      const sanitizedText = sanitizeTimelineText(trace.text);
+      if (!sanitizedText) {
+        return null;
+      }
+
       return {
         type: 'trace',
         trace: {
           traceKind: trace.traceKind,
-          text: trace.text,
+          text: sanitizedText,
           actionKind: isActionKind(trace.actionKind) ? trace.actionKind : undefined
         }
       };
@@ -251,7 +282,15 @@ const ensureStreamListener = (
     }
 
     if (event.type === 'trace' && event.trace) {
-      const trace = event.trace;
+      const traceText = sanitizeTimelineText(event.trace.text);
+      if (!traceText) {
+        return;
+      }
+
+      const trace: MessageStreamTrace = {
+        ...event.trace,
+        text: traceText
+      };
       set((current) => {
         const nextTimeline = [...current.streaming.timeline, { type: 'trace', trace } as StreamTimelineEntry];
         return {

@@ -10,6 +10,7 @@ import {
 } from '../services/db';
 import { listAnthropicModels, testAnthropicConnection } from '../services/providers/anthropic';
 import { listGeminiModels, testGeminiConnection } from '../services/providers/gemini';
+import { listGrokModels, testGrokConnection } from '../services/providers/grok';
 import { getSecret, removeSecret, setSecret } from '../services/keychain';
 import { getCodexDeviceAuthState, getCodexLoginStatus, listCodexAvailableModels, startCodexDeviceAuth } from '../services/providers/codex';
 import { getOllamaDiagnostics, listOllamaModels, testOllamaConnection } from '../services/providers/ollama';
@@ -66,7 +67,6 @@ const openAICompatibleProfileIdSettingKey = (providerId: string): string => `pro
 const openRouterPricingSettingKey = (providerId: string): string => `provider_openrouter_pricing:${providerId}`;
 const openRouterAppOriginSettingKey = (providerId: string): string => `provider_openrouter_app_origin:${providerId}`;
 const openRouterAppTitleSettingKey = (providerId: string): string => `provider_openrouter_app_title:${providerId}`;
-const GROK_API_BASE_URL = 'https://api.x.ai/v1';
 
 type OpenAICompatibleProfile = {
   id: string;
@@ -148,7 +148,7 @@ const syncModelsForProvider = async (
   }
 
   if (provider.type === 'grok') {
-    const modelIds = await listOpenAIModels(secret ?? '', GROK_API_BASE_URL);
+    const modelIds = await listGrokModels(secret ?? '');
     return replaceProviderModelProfiles(provider.id, modelIds).map(mapModelProfile);
   }
 
@@ -265,7 +265,7 @@ export const registerProviderHandlers = (): void => {
         return { ok: false, reason: 'No secret saved for provider' };
       }
 
-      const result = await testOpenAIConnection(secret, GROK_API_BASE_URL);
+      const result = await testGrokConnection(secret);
       const models = result.ok ? await syncModelsForProvider(provider, secret) : [];
       return {
         ok: result.ok,
