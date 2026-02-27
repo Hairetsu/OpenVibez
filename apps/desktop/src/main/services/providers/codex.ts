@@ -32,6 +32,7 @@ export type CodexCompletionInput = {
   fullAccess?: boolean;
   approvalPolicy?: 'untrusted' | 'on-failure' | 'on-request' | 'never';
   outputSchemaJson?: string;
+  sdkPilotEnabled?: boolean;
   signal?: AbortSignal;
   onEvent?: (event: CodexStreamEvent) => void;
 };
@@ -504,10 +505,290 @@ export const startCodexDeviceAuth = async (): Promise<CodexDeviceAuthState> => {
 
 export const getCodexDeviceAuthState = (): CodexDeviceAuthState => deviceAuthState;
 
+const parseOutputSchemaJson = (outputSchemaJson?: string): Record<string, unknown> | undefined => {
+  if (!outputSchemaJson?.trim()) {
+    return undefined;
+  }
+
+  let parsedSchema: unknown;
+  try {
+    parsedSchema = JSON.parse(outputSchemaJson);
+  } catch {
+    throw new Error('Codex output schema must be valid JSON.');
+  }
+
+  if (!parsedSchema || typeof parsedSchema !== 'object' || Array.isArray(parsedSchema)) {
+    throw new Error('Codex output schema must be a JSON object.');
+  }
+
+  return parsedSchema as Record<string, unknown>;
+};
+
+const emitSdkItemEvent = (item: Record<string, unknown>, input: CodexCompletionInput, onAssistantText: (delta: string) => void): void => {
+  const itemType = typeof item.type === 'string' ? item.type : '';
+
+  if (itemType === 'agent_message') {
+    const text = typeof item.text === 'string' ? item.text : '';
+    if (text) {
+      onAssistantText(text);
+      input.onEvent?.({ type: 'assistant_delta', delta: text });
+    }
+    return;
+  }
+
+  if (itemType === 'reasoning') {
+    const text = typeof item.text === 'string' ? item.text : '';
+    if (text) {
+      input.onEvent?.({
+        type: 'trace',
+        traceKind: classifyReasoning(text),
+        text
+      });
+    }
+    return;
+  }
+
+  if (itemType === 'command_execution') {
+    const command = typeof item.command === 'string' ? item.command.trim() : '';
+    if (command) {
+      input.onEvent?.({
+        type: 'trace',
+        traceKind: 'action',
+        text: `Command:\n${command}`,
+        actionKind: 'command'
+      });
+    }
+
+    const output = typeof item.aggregated_output === 'string' ? item.aggregated_output.trim() : '';
+    const exitCode = typeof item.exit_code === 'number' ? item.exit_code : null;
+    if (output || exitCode !== null) {
+      const details = [
+        exitCode !== null ? `exit: ${exitCode}` : '',
+        output ? `output:\n${output}` : ''
+      ].filter((line) => line.length > 0);
+
+      if (details.length > 0) {
+        input.onEvent?.({
+          type: 'trace',
+          traceKind: 'action',
+          text: details.join('\n\n'),
+          actionKind: 'command-result'
+        });
+      }
+    }
+    return;
+  }
+
+  if (itemType === 'file_change') {
+    const changes = Array.isArray(item.changes) ? item.changes : [];
+    const fileLines = changes
+      .map((entry) => {
+        const record = asRecord(entry);
+        if (!record) {
+          return '';
+        }
+
+        const filePath = typeof record.path === 'string' ? record.path.trim() : '';
+        const kind = typeof record.kind === 'string' ? record.kind.trim() : 'update';
+        if (!filePath) {
+          return '';
+        }
+        return `${kind}: ${filePath}`;
+      })
+      .filter((line) => line.length > 0);
+
+    if (fileLines.length > 0) {
+      input.onEvent?.({
+        type: 'trace',
+        traceKind: 'action',
+        text: fileLines.join('\n'),
+        actionKind: 'file-edit'
+      });
+    }
+    return;
+  }
+
+  if (itemType === 'web_search') {
+    const query = typeof item.query === 'string' ? item.query.trim() : '';
+    if (query) {
+      input.onEvent?.({
+        type: 'trace',
+        traceKind: 'action',
+        text: `Searched for: ${query}`,
+        actionKind: 'search'
+      });
+    }
+    return;
+  }
+
+  if (itemType === 'todo_list' && Array.isArray(item.items)) {
+    const lines = item.items
+      .map((entry) => asRecord(entry))
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+      .map((entry, index) => {
+        const text = typeof entry.text === 'string' ? entry.text.trim() : '';
+        const done = entry.completed === true;
+        if (!text) {
+          return '';
+        }
+        return `[${done ? 'x' : ' '}] ${index + 1}. ${text}`;
+      })
+      .filter((line) => line.length > 0);
+
+    if (lines.length > 0) {
+      input.onEvent?.({
+        type: 'trace',
+        traceKind: 'plan',
+        text: lines.join('\n')
+      });
+    }
+    return;
+  }
+
+  if (itemType === 'error') {
+    const message = typeof item.message === 'string' ? item.message.trim() : '';
+    if (message) {
+      input.onEvent?.({
+        type: 'trace',
+        traceKind: 'action',
+        text: message,
+        actionKind: 'generic'
+      });
+    }
+  }
+};
+
+const createCodexCompletionWithSdkPilot = async (input: CodexCompletionInput & {
+  prompt: string;
+  outputSchema?: Record<string, unknown>;
+}): Promise<CodexCompletionResult | null> => {
+  if (!input.sdkPilotEnabled) {
+    return null;
+  }
+
+  const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<unknown>;
+  let module: unknown;
+
+  try {
+    module = await dynamicImport('@openai/codex-sdk');
+  } catch {
+    return null;
+  }
+
+  const sdk = module as {
+    Codex?: new (options?: {
+      codexPathOverride?: string;
+      env?: Record<string, string>;
+    }) => {
+      startThread: (options?: Record<string, unknown>) => {
+        runStreamed: (
+          input: string | Array<{ type: 'text'; text: string } | { type: 'local_image'; path: string }>,
+          turnOptions?: { outputSchema?: Record<string, unknown>; signal?: AbortSignal }
+        ) => Promise<{ events: AsyncGenerator<unknown> }>;
+      };
+    };
+  };
+
+  if (!sdk.Codex) {
+    return null;
+  }
+
+  input.onEvent?.({ type: 'status', text: 'Running Codex SDK pilot...' });
+
+  const codex = new sdk.Codex({
+    codexPathOverride: resolveCodexCommand(),
+    env: process.env as Record<string, string>
+  });
+
+  const thread = codex.startThread({
+    model: input.model,
+    sandboxMode: input.fullAccess ? 'danger-full-access' : 'workspace-write',
+    workingDirectory: input.cwd,
+    skipGitRepoCheck: true,
+    approvalPolicy: !input.fullAccess ? input.approvalPolicy : undefined
+  });
+
+  const streamed = await thread.runStreamed(input.prompt, {
+    outputSchema: input.outputSchema,
+    signal: input.signal
+  });
+
+  let assistantText = '';
+  let inputTokens: number | undefined;
+  let outputTokens: number | undefined;
+
+  for await (const event of streamed.events) {
+    const record = asRecord(event);
+    if (!record) {
+      continue;
+    }
+
+    const type = typeof record.type === 'string' ? record.type : '';
+
+    if (type === 'turn.started') {
+      input.onEvent?.({ type: 'status', text: 'Planning...' });
+      continue;
+    }
+
+    if (type === 'turn.completed') {
+      const usage = asRecord(record.usage);
+      if (usage) {
+        inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : undefined;
+        outputTokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : undefined;
+      }
+      input.onEvent?.({ type: 'status', text: 'Finalizing response...' });
+      continue;
+    }
+
+    if (type === 'turn.failed') {
+      const error = asRecord(record.error);
+      const message = typeof error?.message === 'string' && error.message.trim()
+        ? error.message.trim()
+        : 'Codex SDK turn failed.';
+      throw new Error(message);
+    }
+
+    if ((type === 'item.completed' || type === 'item.updated') && asRecord(record.item)) {
+      emitSdkItemEvent(asRecord(record.item) ?? {}, input, (delta) => {
+        assistantText += delta;
+      });
+      continue;
+    }
+
+    if (type === 'error') {
+      const message = typeof record.message === 'string' ? record.message.trim() : '';
+      if (message) {
+        throw new Error(message);
+      }
+    }
+  }
+
+  if (!assistantText.trim()) {
+    throw new Error('Codex SDK returned empty output');
+  }
+
+  return {
+    text: assistantText.trim(),
+    inputTokens,
+    outputTokens
+  };
+};
+
 export const createCodexCompletion = async (input: CodexCompletionInput): Promise<CodexCompletionResult> => {
   const messagePath = path.join(os.tmpdir(), `openvibez-codex-${randomUUID()}.txt`);
   const outputSchemaPath = path.join(os.tmpdir(), `openvibez-codex-schema-${randomUUID()}.json`);
   const prompt = buildCodexPrompt(input.history);
+  const parsedOutputSchema = parseOutputSchemaJson(input.outputSchemaJson);
+
+  const sdkPilot = await createCodexCompletionWithSdkPilot({
+    ...input,
+    prompt,
+    outputSchema: parsedOutputSchema
+  });
+
+  if (sdkPilot) {
+    return sdkPilot;
+  }
 
   const args = ['exec', '--skip-git-repo-check', '--json', '--output-last-message', messagePath];
 
@@ -525,19 +806,8 @@ export const createCodexCompletion = async (input: CodexCompletionInput): Promis
     args.push('--ask-for-approval', input.approvalPolicy);
   }
 
-  if (input.outputSchemaJson?.trim()) {
-    let parsedSchema: unknown;
-    try {
-      parsedSchema = JSON.parse(input.outputSchemaJson);
-    } catch {
-      throw new Error('Codex output schema must be valid JSON.');
-    }
-
-    if (!parsedSchema || typeof parsedSchema !== 'object' || Array.isArray(parsedSchema)) {
-      throw new Error('Codex output schema must be a JSON object.');
-    }
-
-    await fs.writeFile(outputSchemaPath, JSON.stringify(parsedSchema, null, 2), 'utf8');
+  if (parsedOutputSchema) {
+    await fs.writeFile(outputSchemaPath, JSON.stringify(parsedOutputSchema, null, 2), 'utf8');
     args.push('--output-schema', outputSchemaPath);
   }
 

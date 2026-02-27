@@ -87,14 +87,35 @@ npm run db:studio
 
 ---
 
-## Recent Improvements
+## Robustness Program (Phases 1-3)
 
-- **Local tool-calling agent loop (Ollama)** — local models now receive a strict tool protocol and can run iterative CLI actions (`run_shell`) until tasks are complete.
-- **Checklist-driven execution** — local runs now require an explicit plan, step checkoffs, and finalization only after all steps are complete.
-- **Inline iteration feed** — action traces (planned steps, commands, exit codes, truncated stdout/stderr) now render directly in the message feed.
-- **Cross-provider cancel support** — active runs can be cancelled from the composer button for OpenAI, Codex subscription, and local/Ollama sessions.
-- **Send-vs-cancel composer behavior** — when text exists, pressing the button sends new input; when empty during an active run, it cancels the run.
-- **Interrupt-and-replace flow** — sending a new message during an active run now cancels the in-flight run first, then starts the new request.
+The roadmap in [docs/ROBUSTNESS_PROPOSALS.md](docs/ROBUSTNESS_PROPOSALS.md) is now implemented through Phase 3.
+
+### Phase 1 (core reliability)
+
+- **Provider runner split** — chat orchestration now routes through a stable runner contract (`OpenAI`, `Codex`, `Local/Ollama`) instead of one monolithic provider loop.
+- **OpenAI SDK-first path** — OpenAI completions use official SDK event handling for streaming and usage capture.
+- **Hard command policy enforcement** — shell calls are guarded by workspace trust + access mode rules (scoped cwd enforcement, read-only mutation blocking, root restricted to trusted workspaces).
+- **Idempotent send/run flow** — `clientRequestId` + `assistant_runs` uniqueness prevent duplicate user/assistant rows during retries and races.
+
+### Phase 2 (durability + provider controls)
+
+- **Durable run journal** — `assistant_runs` lifecycle and recovery flow handle restart reconciliation for interrupted runs.
+- **Codex execution controls** — approval policy and optional JSON output schema are configurable and enforced in Codex execution.
+- **Ollama native tools-first execution** — native tool calling is attempted first, with protocol fallback retained for weaker local models.
+- **Trace/event normalization** — provider traces and streamed deltas map consistently into the shared timeline feed.
+
+### Phase 3 (flagged pilots)
+
+- **OpenAI background mode pilot** — optional background response execution with persisted `background_jobs` state and polling recovery.
+- **Background scheduler** — main-process scheduler resumes/finishes active OpenAI background jobs after restarts.
+- **Codex SDK pilot** — optional SDK path is available behind a setting, with CLI integration kept as default fallback.
+- **Webhook verification helper** — OpenAI webhook unwrap helper is included for signature-verified event ingestion paths.
+
+### Operational notes
+
+- OpenAI background mode and Codex SDK pilot are opt-in in Provider Settings.
+- Default behavior remains conservative: OpenAI streaming and Codex CLI paths stay available as fallback.
 
 ---
 
@@ -106,17 +127,24 @@ npm run db:studio
 - [x] ChatGPT subscription auth via Codex CLI device login
 - [x] Local model support via Ollama (default `http://127.0.0.1:11434`)
 - [x] Local CLI tool execution loop (`run_shell`) with multi-step autonomous task completion
+- [x] Ollama native tool-calling path with protocol fallback
 - [x] Plan/checklist enforcement for local agent runs
 - [x] Model discovery — auto-sync available models from provider
 - [x] Session management — create, switch, persist conversations
 - [x] Streaming chat with real-time text deltas
 - [x] Trace visualization — thought, plan, and action traces during execution (inline in message feed)
 - [x] Cancel in-flight requests (OpenAI, Codex, and local/Ollama)
+- [x] Provider runner architecture (`OpenAI`, `Codex`, `Local/Ollama`)
+- [x] Command policy enforcement for workspace trust/access modes
+- [x] Send idempotency via `clientRequestId` + durable `assistant_runs`
+- [x] Restart recovery for interrupted runs
 - [x] Workspace scoping — attach project directories, control execution sandbox
 - [x] Scoped vs root execution modes
 - [x] Token usage tracking with 30-day cost summary
 - [x] SQLite persistence for all data (Drizzle ORM)
-- [x] Background job scheduler infrastructure
+- [x] OpenAI background jobs (`background_jobs`) + scheduler recovery
+- [x] Codex approval policy + output schema controls
+- [x] Codex SDK pilot toggle (CLI fallback retained)
 
 ---
 

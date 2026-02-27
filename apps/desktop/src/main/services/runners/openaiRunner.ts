@@ -13,8 +13,12 @@ export const runOpenAI: ProviderRunner = async (input) => {
 
   const completion = await createOpenAICompletion({
     apiKey: input.secret,
+    providerId: input.provider.id,
     model: resolveOpenAIModel(input.modelProfileId, input.requestedModelId),
     history: input.history,
+    requestMeta: input.requestMeta,
+    backgroundModeEnabled: input.openaiOptions?.backgroundModeEnabled,
+    backgroundPollIntervalMs: input.openaiOptions?.backgroundPollIntervalMs,
     signal: input.signal,
     onEvent: (event) => {
       if (event.type === 'status' && event.text) {

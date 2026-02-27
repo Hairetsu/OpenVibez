@@ -27,12 +27,22 @@ export type RunnerContext = {
   secret: string | null;
   modelProfileId: string | null;
   requestedModelId?: string;
+  requestMeta?: {
+    runId: string;
+    sessionId: string;
+    clientRequestId: string;
+  };
   history: RunnerHistoryMessage[];
   accessMode: 'scoped' | 'root';
   workspace?: WorkspaceRow;
+  openaiOptions?: {
+    backgroundModeEnabled?: boolean;
+    backgroundPollIntervalMs?: number;
+  };
   codexOptions?: {
     approvalPolicy?: 'untrusted' | 'on-failure' | 'on-request' | 'never';
     outputSchemaJson?: string;
+    sdkPilotEnabled?: boolean;
   };
   signal: AbortSignal;
   onEvent?: (event: RunnerEvent) => void;

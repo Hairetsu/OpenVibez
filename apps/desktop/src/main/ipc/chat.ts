@@ -12,6 +12,7 @@ import {
   getProviderById,
   getSessionById,
   getWorkspaceById,
+  listBackgroundJobs,
   listAssistantRunsByStatus,
   listMessages,
   listSessions,
@@ -25,7 +26,7 @@ import {
 import { getSecret } from '../services/keychain';
 import { createCodexCompletion } from '../services/providers/codex';
 import { createOllamaCompletion } from '../services/providers/ollama';
-import { createOpenAICompletion } from '../services/providers/openai';
+import { createOpenAICompletion, getOpenAIBackgroundJobKind } from '../services/providers/openai';
 import { resolveOllamaModel, resolveOpenAIModel } from '../services/runners/models';
 import { runCodexSubscription, runLocalOllama, runOpenAI } from '../services/runners';
 import type { ProviderRunner, RunnerContext, RunnerEvent } from '../services/runners';
@@ -235,6 +236,7 @@ const generateSessionTitle = async (input: {
     const completion = await createCodexCompletion({
       history,
       model: input.requestedModelId,
+      sdkPilotEnabled: getSetting('codex_sdk_pilot_enabled') === true,
       signal: input.signal
     });
 
@@ -345,6 +347,7 @@ const mapRunnerEventToStream = (
 const resolveCodexOptions = (): RunnerContext['codexOptions'] => {
   const approval = getSetting('codex_approval_policy');
   const outputSchema = getSetting('codex_output_schema_json');
+  const sdkPilotEnabled = getSetting('codex_sdk_pilot_enabled') === true;
 
   const approvalPolicy =
     approval === 'untrusted' || approval === 'on-failure' || approval === 'on-request' || approval === 'never'
@@ -355,11 +358,44 @@ const resolveCodexOptions = (): RunnerContext['codexOptions'] => {
 
   return {
     approvalPolicy,
-    outputSchemaJson
+    outputSchemaJson,
+    sdkPilotEnabled
+  };
+};
+
+const resolveOpenAIOptions = (): RunnerContext['openaiOptions'] => {
+  const backgroundModeEnabled = getSetting('openai_background_mode_enabled') === true;
+  const pollRaw = getSetting('openai_background_poll_interval_ms');
+
+  const backgroundPollIntervalMs =
+    typeof pollRaw === 'number' && Number.isFinite(pollRaw) && pollRaw >= 500
+      ? Math.trunc(pollRaw)
+      : undefined;
+
+  return {
+    backgroundModeEnabled,
+    backgroundPollIntervalMs
   };
 };
 
 const reconcileInterruptedRuns = (): void => {
+  const activeBackgroundRunIds = new Set<string>();
+  const backgroundJobs = listBackgroundJobs({
+    kind: getOpenAIBackgroundJobKind(),
+    states: ['pending', 'running']
+  });
+
+  for (const job of backgroundJobs) {
+    if (!job.payload || typeof job.payload !== 'object') {
+      continue;
+    }
+
+    const runId = (job.payload as { runId?: unknown }).runId;
+    if (typeof runId === 'string' && runId.trim()) {
+      activeBackgroundRunIds.add(runId.trim());
+    }
+  }
+
   const staleRuns = listAssistantRunsByStatus('running');
   if (staleRuns.length === 0) {
     return;
@@ -367,6 +403,10 @@ const reconcileInterruptedRuns = (): void => {
 
   for (const run of staleRuns) {
     try {
+      if (activeBackgroundRunIds.has(run.id)) {
+        continue;
+      }
+
       if (!run.session_id || run.assistant_message_id) {
         markAssistantRunRecovered({
           runId: run.id,
@@ -608,9 +648,15 @@ export const registerChatHandlers = (): void => {
         secret,
         modelProfileId: session.model_profile_id,
         requestedModelId: parsed.modelId,
+        requestMeta: {
+          runId: run.id,
+          sessionId: parsed.sessionId,
+          clientRequestId
+        },
         history,
         accessMode: effectiveAccessMode,
         workspace,
+        openaiOptions: resolveOpenAIOptions(),
         codexOptions: resolveCodexOptions(),
         signal: controller.signal,
         onEvent: (runnerEvent) => {

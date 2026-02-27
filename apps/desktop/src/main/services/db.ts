@@ -79,6 +79,23 @@ export type AssistantRunRow = {
   updated_at: number;
 };
 
+export type BackgroundJobState = 'pending' | 'running' | 'completed' | 'failed';
+
+export type BackgroundJobRow = {
+  id: string;
+  kind: string;
+  state: BackgroundJobState;
+  payload_json: string;
+  attempt_count: number;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export type BackgroundJob = Omit<BackgroundJobRow, 'payload_json'> & {
+  payload: unknown;
+};
+
 let sqlite: Database.Database | null = null;
 
 const now = (): number => Date.now();
@@ -474,6 +491,10 @@ export const getAssistantRunByClientRequest = (input: {
     .get(input.sessionId, input.clientRequestId) as AssistantRunRow | undefined;
 };
 
+export const getAssistantRunById = (runId: string): AssistantRunRow | undefined => {
+  return getDb().prepare('SELECT * FROM assistant_runs WHERE id = ?').get(runId) as AssistantRunRow | undefined;
+};
+
 export const listAssistantRunsByStatus = (status: AssistantRunRow['status']): AssistantRunRow[] => {
   return getDb()
     .prepare('SELECT * FROM assistant_runs WHERE status = ? ORDER BY created_at ASC')
@@ -604,4 +625,139 @@ export const summarizeUsage = (days: number): { input_tokens: number; output_tok
     };
 
   return row;
+};
+
+const mapBackgroundJobRow = (row: BackgroundJobRow): BackgroundJob => {
+  let payload: unknown = null;
+  try {
+    payload = JSON.parse(row.payload_json);
+  } catch {
+    payload = null;
+  }
+
+  return {
+    id: row.id,
+    kind: row.kind,
+    state: row.state,
+    payload,
+    attempt_count: row.attempt_count,
+    last_error: row.last_error,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+};
+
+export const upsertBackgroundJob = (input: {
+  id: string;
+  kind: string;
+  state: BackgroundJobState;
+  payload: unknown;
+  attemptCount?: number;
+  lastError?: string | null;
+}): BackgroundJob => {
+  const ts = now();
+  getDb()
+    .prepare(
+      `INSERT INTO background_jobs (id, kind, state, payload_json, attempt_count, last_error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         kind = excluded.kind,
+         state = excluded.state,
+         payload_json = excluded.payload_json,
+         attempt_count = excluded.attempt_count,
+         last_error = excluded.last_error,
+         updated_at = excluded.updated_at`
+    )
+    .run(
+      input.id,
+      input.kind,
+      input.state,
+      JSON.stringify(input.payload ?? null),
+      input.attemptCount ?? 0,
+      input.lastError ?? null,
+      ts,
+      ts
+    );
+
+  const row = getDb().prepare('SELECT * FROM background_jobs WHERE id = ?').get(input.id) as BackgroundJobRow;
+  return mapBackgroundJobRow(row);
+};
+
+export const getBackgroundJobById = (jobId: string): BackgroundJob | undefined => {
+  const row = getDb().prepare('SELECT * FROM background_jobs WHERE id = ?').get(jobId) as BackgroundJobRow | undefined;
+  return row ? mapBackgroundJobRow(row) : undefined;
+};
+
+export const listBackgroundJobs = (input?: {
+  kind?: string;
+  states?: BackgroundJobState[];
+  limit?: number;
+}): BackgroundJob[] => {
+  const clauses: string[] = [];
+  const params: Array<string | number> = [];
+
+  if (input?.kind) {
+    clauses.push('kind = ?');
+    params.push(input.kind);
+  }
+
+  if (input?.states && input.states.length > 0) {
+    const placeholders = input.states.map(() => '?').join(', ');
+    clauses.push(`state IN (${placeholders})`);
+    params.push(...input.states);
+  }
+
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const limit = typeof input?.limit === 'number' && Number.isFinite(input.limit) && input.limit > 0
+    ? `LIMIT ${Math.trunc(input.limit)}`
+    : '';
+
+  const rows = getDb()
+    .prepare(`SELECT * FROM background_jobs ${where} ORDER BY updated_at ASC ${limit}`)
+    .all(...params) as BackgroundJobRow[];
+
+  return rows.map(mapBackgroundJobRow);
+};
+
+export const updateBackgroundJob = (input: {
+  id: string;
+  state?: BackgroundJobState;
+  payload?: unknown;
+  attemptCount?: number;
+  lastError?: string | null;
+}): void => {
+  const existing = getDb().prepare('SELECT * FROM background_jobs WHERE id = ?').get(input.id) as BackgroundJobRow | undefined;
+  if (!existing) {
+    return;
+  }
+
+  let existingPayload: unknown = null;
+  try {
+    existingPayload = JSON.parse(existing.payload_json);
+  } catch {
+    existingPayload = null;
+  }
+
+  getDb()
+    .prepare(
+      `UPDATE background_jobs
+       SET state = ?,
+           payload_json = ?,
+           attempt_count = ?,
+           last_error = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .run(
+      input.state ?? existing.state,
+      JSON.stringify(input.payload ?? existingPayload),
+      input.attemptCount ?? existing.attempt_count,
+      input.lastError ?? existing.last_error,
+      now(),
+      input.id
+    );
+};
+
+export const deleteBackgroundJob = (jobId: string): void => {
+  getDb().prepare('DELETE FROM background_jobs WHERE id = ?').run(jobId);
 };

@@ -51,6 +51,9 @@ export const ProviderSettings = ({
   const [subscriptionState, setSubscriptionState] = useState<ProviderSubscriptionLoginState | null>(null);
   const [codexApprovalPolicy, setCodexApprovalPolicy] = useState<CodexApprovalPolicy>('on-request');
   const [codexOutputSchema, setCodexOutputSchema] = useState('');
+  const [codexSdkPilotEnabled, setCodexSdkPilotEnabled] = useState(false);
+  const [openaiBackgroundModeEnabled, setOpenaiBackgroundModeEnabled] = useState(false);
+  const [openaiBackgroundPollIntervalMs, setOpenaiBackgroundPollIntervalMs] = useState('2000');
 
   useEffect(() => {
     if (newProviderType === 'local') {
@@ -79,15 +82,25 @@ export const ProviderSettings = ({
   );
 
   useEffect(() => {
-    const loadCodexConfig = async () => {
-      if (!activeProvider || activeProvider.type !== 'openai' || activeProvider.authKind !== 'oauth_subscription') {
+    const loadProviderExecutionControls = async () => {
+      if (!activeProvider || activeProvider.type !== 'openai') {
         return;
       }
 
-      const [approval, schema] = await Promise.all([
+      const [backgroundEnabled, backgroundPollInterval, approval, schema, sdkPilot] = await Promise.all([
+        api.settings.get({ key: 'openai_background_mode_enabled' }),
+        api.settings.get({ key: 'openai_background_poll_interval_ms' }),
         api.settings.get({ key: 'codex_approval_policy' }),
-        api.settings.get({ key: 'codex_output_schema_json' })
+        api.settings.get({ key: 'codex_output_schema_json' }),
+        api.settings.get({ key: 'codex_sdk_pilot_enabled' })
       ]);
+
+      setOpenaiBackgroundModeEnabled(backgroundEnabled === true);
+      setOpenaiBackgroundPollIntervalMs(
+        typeof backgroundPollInterval === 'number' && Number.isFinite(backgroundPollInterval)
+          ? String(Math.max(500, Math.trunc(backgroundPollInterval)))
+          : '2000'
+      );
 
       if (approval === 'untrusted' || approval === 'on-failure' || approval === 'on-request' || approval === 'never') {
         setCodexApprovalPolicy(approval);
@@ -98,9 +111,11 @@ export const ProviderSettings = ({
       } else {
         setCodexOutputSchema('');
       }
+
+      setCodexSdkPilotEnabled(sdkPilot === true);
     };
 
-    void loadCodexConfig();
+    void loadProviderExecutionControls();
   }, [activeProvider]);
 
   const onCreate = async () => {
@@ -190,10 +205,27 @@ export const ProviderSettings = ({
 
     await Promise.all([
       api.settings.set({ key: 'codex_approval_policy', value: codexApprovalPolicy }),
-      api.settings.set({ key: 'codex_output_schema_json', value: codexOutputSchema.trim() })
+      api.settings.set({ key: 'codex_output_schema_json', value: codexOutputSchema.trim() }),
+      api.settings.set({ key: 'codex_sdk_pilot_enabled', value: codexSdkPilotEnabled })
     ]);
 
     setStatus('Saved Codex execution controls.');
+  };
+
+  const onSaveOpenAIBackgroundControls = async () => {
+    const trimmed = openaiBackgroundPollIntervalMs.trim();
+    const parsedPoll = Number.parseInt(trimmed || '0', 10);
+    if (!Number.isFinite(parsedPoll) || parsedPoll < 500) {
+      setStatus('Background poll interval must be a whole number >= 500ms.');
+      return;
+    }
+
+    await Promise.all([
+      api.settings.set({ key: 'openai_background_mode_enabled', value: openaiBackgroundModeEnabled }),
+      api.settings.set({ key: 'openai_background_poll_interval_ms', value: parsedPoll })
+    ]);
+
+    setStatus('Saved OpenAI background controls.');
   };
 
   return (
@@ -323,11 +355,48 @@ export const ProviderSettings = ({
                 placeholder='{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}'
                 className="min-h-[84px] font-mono text-[11px]"
               />
+              <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={codexSdkPilotEnabled}
+                  onChange={(e) => setCodexSdkPilotEnabled(e.target.checked)}
+                  className="h-3.5 w-3.5"
+                />
+                Enable Codex SDK pilot (CLI remains fallback)
+              </label>
               <div className="flex justify-end">
                 <Button size="sm" variant="outline" type="button" onClick={() => void onSaveCodexControls()}>
                   Save Codex Controls
                 </Button>
               </div>
+            </div>
+          </div>
+        )}
+
+        {activeProvider?.type === 'openai' && (
+          <div className="grid gap-2 rounded-md border border-border/40 bg-background/30 p-2.5">
+            <Label className="text-[11px]">OpenAI long-run background mode</Label>
+            <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={openaiBackgroundModeEnabled}
+                onChange={(e) => setOpenaiBackgroundModeEnabled(e.target.checked)}
+                className="h-3.5 w-3.5"
+              />
+              Enable background response mode (Phase 3 pilot)
+            </label>
+
+            <Label className="text-[11px]">Background poll interval (ms)</Label>
+            <Input
+              value={openaiBackgroundPollIntervalMs}
+              onChange={(e) => setOpenaiBackgroundPollIntervalMs(e.target.value)}
+              placeholder="2000"
+              className="h-8"
+            />
+            <div className="flex justify-end">
+              <Button size="sm" variant="outline" type="button" onClick={() => void onSaveOpenAIBackgroundControls()}>
+                Save OpenAI Background Controls
+              </Button>
             </div>
           </div>
         )}
