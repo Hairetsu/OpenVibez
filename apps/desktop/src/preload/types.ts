@@ -1,6 +1,6 @@
 export type Provider = {
   id: string;
-  type: 'openai' | 'anthropic' | 'local';
+  type: 'openai' | 'anthropic' | 'gemini' | 'openrouter' | 'grok' | 'local';
   displayName: string;
   authKind: 'api_key' | 'oauth_subscription';
   keychainRef: string | null;
@@ -95,6 +95,16 @@ export type OpenVibezApi = {
     getSubscriptionLoginState: () => Promise<ProviderSubscriptionLoginState>;
     listModels: (input: { providerId: string }) => Promise<ModelProfile[]>;
     refreshModels: (input: { providerId: string }) => Promise<ModelProfile[]>;
+    localDiagnostics: (input: { providerId: string }) => Promise<{
+      baseUrl: string;
+      reachable: boolean;
+      tagsStatus: number;
+      latencyMs: number;
+      modelCount: number;
+      runningModelCount: number;
+      version?: string;
+      error?: string;
+    }>;
   };
   session: {
     create: (input: { title: string; providerId: string; workspaceId?: string; modelProfileId?: string }) => Promise<Session>;

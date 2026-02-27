@@ -23,6 +23,7 @@ type OllamaCompletionInput = {
   history: HistoryMessage[];
   temperature?: number;
   maxOutputTokens?: number;
+  numCtx?: number;
   stream?: boolean;
   signal?: AbortSignal;
   onEvent?: (event: { type: 'status' | 'assistant_delta'; text?: string; delta?: string }) => void;
@@ -39,6 +40,9 @@ type OllamaToolTurnInput = {
   baseUrl?: string;
   model: string;
   messages: OllamaToolMessage[];
+  temperature?: number;
+  maxOutputTokens?: number;
+  numCtx?: number;
   tools: Array<{
     type: 'function';
     function: {
@@ -187,6 +191,9 @@ export const createOllamaCompletion = async (input: OllamaCompletionInput): Prom
 
   if (typeof input.maxOutputTokens === 'number') {
     options.num_predict = input.maxOutputTokens;
+  }
+  if (typeof input.numCtx === 'number' && Number.isFinite(input.numCtx)) {
+    options.num_ctx = Math.max(256, Math.trunc(input.numCtx));
   }
 
   const body: Record<string, unknown> = {
@@ -405,6 +412,17 @@ const normalizeToolCalls = (value: unknown): OllamaToolCall[] => {
 export const createOllamaToolTurn = async (input: OllamaToolTurnInput): Promise<OllamaToolTurnResult> => {
   const resolvedBase = normalizeBaseUrl(input.baseUrl);
   let res: Response;
+  const options: Record<string, unknown> = {};
+
+  if (typeof input.temperature === 'number') {
+    options.temperature = input.temperature;
+  }
+  if (typeof input.maxOutputTokens === 'number') {
+    options.num_predict = input.maxOutputTokens;
+  }
+  if (typeof input.numCtx === 'number' && Number.isFinite(input.numCtx)) {
+    options.num_ctx = Math.max(256, Math.trunc(input.numCtx));
+  }
 
   try {
     res = await fetch(makeOllamaUrl(resolvedBase, '/api/chat'), {
@@ -421,7 +439,8 @@ export const createOllamaToolTurn = async (input: OllamaToolTurnInput): Promise<
           content: message.content,
           ...(message.toolCalls ? { tool_calls: message.toolCalls } : {})
         })),
-        tools: input.tools
+        tools: input.tools,
+        ...(Object.keys(options).length > 0 ? { options } : {})
       })
     });
   } catch (error) {
@@ -476,4 +495,73 @@ export const createOllamaToolTurn = async (input: OllamaToolTurnInput): Promise<
     inputTokens,
     outputTokens
   };
+};
+
+export const getOllamaDiagnostics = async (baseUrl?: string): Promise<{
+  baseUrl: string;
+  reachable: boolean;
+  tagsStatus: number;
+  latencyMs: number;
+  modelCount: number;
+  runningModelCount: number;
+  version?: string;
+  error?: string;
+}> => {
+  const resolvedBase = normalizeBaseUrl(baseUrl);
+  const started = Date.now();
+
+  try {
+    const tagsRes = await fetch(makeOllamaUrl(resolvedBase, '/api/tags'), { method: 'GET' });
+    const latencyMs = Date.now() - started;
+    const tagsPayload = (await tagsRes.json().catch(() => null)) as
+      | { models?: Array<unknown> }
+      | null;
+
+    let runningModelCount = 0;
+    try {
+      const psRes = await fetch(makeOllamaUrl(resolvedBase, '/api/ps'), { method: 'GET' });
+      if (psRes.ok) {
+        const psPayload = (await psRes.json().catch(() => null)) as
+          | { models?: Array<unknown> }
+          | null;
+        runningModelCount = Array.isArray(psPayload?.models) ? psPayload.models.length : 0;
+      }
+    } catch {
+      runningModelCount = 0;
+    }
+
+    let version: string | undefined;
+    try {
+      const versionRes = await fetch(makeOllamaUrl(resolvedBase, '/api/version'), { method: 'GET' });
+      if (versionRes.ok) {
+        const versionPayload = (await versionRes.json().catch(() => null)) as { version?: unknown } | null;
+        if (typeof versionPayload?.version === 'string' && versionPayload.version.trim()) {
+          version = versionPayload.version.trim();
+        }
+      }
+    } catch {
+      version = undefined;
+    }
+
+    return {
+      baseUrl: resolvedBase,
+      reachable: tagsRes.ok,
+      tagsStatus: tagsRes.status,
+      latencyMs,
+      modelCount: Array.isArray(tagsPayload?.models) ? tagsPayload.models.length : 0,
+      runningModelCount,
+      version,
+      ...(tagsRes.ok ? {} : { error: await parseConnectionError(tagsRes) })
+    };
+  } catch (error) {
+    return {
+      baseUrl: resolvedBase,
+      reachable: false,
+      tagsStatus: 0,
+      latencyMs: Date.now() - started,
+      modelCount: 0,
+      runningModelCount: 0,
+      error: asErrorMessage(error)
+    };
+  }
 };

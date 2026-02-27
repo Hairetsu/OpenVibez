@@ -20,6 +20,7 @@ export type RunnerResult = {
   text: string;
   inputTokens?: number;
   outputTokens?: number;
+  costMicrounits?: number;
 };
 
 export type RunnerContext = {
@@ -44,6 +45,16 @@ export type RunnerContext = {
     approvalPolicy?: 'untrusted' | 'on-failure' | 'on-request' | 'never';
     outputSchemaJson?: string;
     sdkPilotEnabled?: boolean;
+  };
+  openrouterOptions?: {
+    appOrigin?: string;
+    appTitle?: string;
+    pricingByModel?: Record<string, { promptPerToken: number; completionPerToken: number }>;
+  };
+  localOptions?: {
+    temperature?: number;
+    maxOutputTokens?: number;
+    numCtx?: number;
   };
   signal: AbortSignal;
   onEvent?: (event: RunnerEvent) => void;

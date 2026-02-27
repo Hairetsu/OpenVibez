@@ -6,7 +6,7 @@ import { makeId } from '../util/ids';
 
 export type ProviderRow = {
   id: string;
-  type: 'openai' | 'anthropic' | 'local';
+  type: 'openai' | 'anthropic' | 'gemini' | 'openrouter' | 'grok' | 'local';
   display_name: string;
   auth_kind: 'api_key' | 'oauth_subscription';
   keychain_ref: string | null;

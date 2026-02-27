@@ -7,7 +7,7 @@ OpenVibez gives you a native chat interface that connects to the AI providers yo
 ![Chat View](docs/screenshots/chat-empty.png)
 ![Settings](docs/screenshots/settings.png)
 
-> **Status:** Early alpha. Core chat loop works with OpenAI API keys, ChatGPT subscriptions, Anthropic API keys, and local Ollama models, including autonomous local CLI execution and cancellable runs.
+> **Status:** Early alpha. Core chat loop works with OpenAI API keys, ChatGPT subscriptions, Anthropic API keys, Gemini API keys, OpenRouter API keys, Grok API keys, and local Ollama models, including autonomous local CLI execution and cancellable runs.
 
 > [!WARNING]
 > **This is very early alpha software.** I've directed the vision, but fully embraced the vibes while building it — and it shows. OpenVibez has direct CLI access and can be given root execution privileges. **I take zero responsibility** for what happens if you hand it the keys to your system. This is a fun experiment, not production software. Use at your own risk.
@@ -72,12 +72,13 @@ npm run db:studio
 ### Connect a provider
 
 1. Launch the app and go to **Settings**
-2. Add a provider (OpenAI API Key, ChatGPT Subscription, Anthropic API Key, or Local/Ollama)
-3. For OpenAI-compatible APIs (OpenAI, OpenRouter, Gemini-compatible, custom): paste key, optionally set API base URL, hit **Save + Test**
+2. Add a provider (OpenAI API Key, ChatGPT Subscription, Anthropic API Key, Gemini API Key, OpenRouter API Key, or Local/Ollama)
+3. For OpenAI-compatible APIs (custom endpoints, LM Studio, vLLM, xAI, etc.): choose OpenAI, add key, pick/set endpoint profile or API base URL, then hit **Save + Test**
 4. For subscription: click **Connect ChatGPT** and complete the device login flow
-5. For Anthropic: paste key and hit **Save + Test**
+5. For Anthropic, Gemini, or OpenRouter: paste key and hit **Save + Test**
 6. For Ollama: select **Local (Ollama)** and use **Test Default** (or save a custom endpoint URL)
-7. Models sync automatically on successful connection
+7. Optional: for OpenAI compatibility mode, save named endpoint profiles and set a default fallback
+8. Models sync automatically on successful connection
 
 ### Environment variables
 
@@ -93,8 +94,12 @@ npm run db:studio
 - [x] Electron shell with frameless macOS title bar and native drag region
 - [x] Provider management — create, configure, test connections
 - [x] API key auth with OS keychain storage (keytar)
-- [x] Multi-provider chat support: OpenAI API, ChatGPT subscription (Codex), Anthropic API, and local Ollama
-- [x] OpenAI-compatible endpoint mode (base URL override) for OpenRouter, Gemini-compatible API, and custom endpoints
+- [x] Multi-provider chat support: OpenAI API, ChatGPT subscription (Codex), Anthropic API, Gemini API, OpenRouter API, and local Ollama
+- [x] Native Gemini provider path with provider-specific model sync and response/error handling
+- [x] OpenRouter first-class provider mode with provider headers (`HTTP-Referer`, `X-Title`) and model pricing sync
+- [x] OpenRouter usage/cost attribution via model pricing map (microunit tracking in usage events)
+- [x] OpenAI-compatible endpoint profiles (named profiles, default profile fallback, per-provider profile selection)
+- [x] OpenAI-compatible endpoint mode (base URL override) for custom OpenAI-style providers (LM Studio, vLLM, xAI, etc.)
 - [x] Model discovery and sync per provider
 - [x] Session management — create, switch, persist conversations
 - [x] Streaming chat with real-time text deltas
@@ -107,6 +112,7 @@ npm run db:studio
 - [x] SQLite persistence for sessions, messages, usage, settings, and background jobs
 - [x] Codex approval policy + output schema controls
 - [x] Optional OpenAI background mode and Codex SDK pilot (both remain opt-in)
+- [x] Advanced Ollama controls (temperature, output tokens, `num_ctx`) plus local diagnostics
 
 ---
 
@@ -118,15 +124,16 @@ Current baseline:
 
 - **OpenAI** (API key + subscription via Codex)
 - **Anthropic / Claude** (API key)
-- **Local Ollama**
-- **OpenAI-compatible endpoints** via base URL override (OpenRouter, Gemini-compatible API, custom providers)
+- **Gemini** native provider mode
+- **OpenRouter** first-class provider mode with usage/cost attribution
+- **Local Ollama** with runtime controls + diagnostics
+- **OpenAI-compatible endpoints** with named profiles and per-provider selection
 
 Next up:
 
-- **Gemini native integration** — direct provider path (not compatibility mode) with dedicated model and error handling.
-- **OpenRouter first-class mode** — provider-specific headers, clearer model defaults, and usage/cost attribution.
-- **Advanced Local / Ollama** — richer runtime controls (provider presets, model options, diagnostics).
-- **Custom OpenAI-compatible profiles** — named endpoint profiles, per-endpoint defaults, and validation UX.
+- **xAI / Grok direct provider mode** — dedicated native path instead of compatibility-only setup.
+- **Provider health monitor** — background checks and actionable status for stale keys/endpoints.
+- **Per-provider model presets** — stronger defaults and quick-select packs by workload.
 
 ### Agent Capabilities
 

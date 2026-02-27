@@ -15,6 +15,7 @@ type HistoryMessage = {
 type OpenAICompletionInput = {
   apiKey: string;
   baseUrl?: string;
+  extraHeaders?: Record<string, string>;
   providerId?: string;
   model: string;
   history: HistoryMessage[];
@@ -233,12 +234,17 @@ const isOfficialOpenAIBaseUrl = (baseUrl?: string): boolean => {
   }
 };
 
-const createClient = (apiKey: string, options?: { webhookSecret?: string | null; baseUrl?: string }): OpenAI => {
+const createClient = (apiKey: string, options?: {
+  webhookSecret?: string | null;
+  baseUrl?: string;
+  defaultHeaders?: Record<string, string>;
+}): OpenAI => {
   const normalizedBaseUrl = normalizeBaseUrl(options?.baseUrl);
   return new OpenAI({
     apiKey,
     webhookSecret: options?.webhookSecret ?? null,
     ...(normalizedBaseUrl ? { baseURL: normalizedBaseUrl } : {}),
+    ...(options?.defaultHeaders ? { defaultHeaders: options.defaultHeaders } : {}),
     maxRetries: 2,
     timeout: 60_000
   });
@@ -337,7 +343,7 @@ export const retrieveOpenAIBackgroundResponse = async (input: {
 const runOpenAIStreaming = async (input: OpenAICompletionInput): Promise<OpenAICompletionResult> => {
   input.onEvent?.({ type: 'status', text: 'Streaming response...' });
 
-  const client = createClient(input.apiKey, { baseUrl: input.baseUrl });
+  const client = createClient(input.apiKey, { baseUrl: input.baseUrl, defaultHeaders: input.extraHeaders });
   const baseRequest = createRequestBody(input);
 
   let fullText = '';
@@ -421,7 +427,7 @@ const runOpenAIStreaming = async (input: OpenAICompletionInput): Promise<OpenAIC
 const runOpenAICompatibleChatStreaming = async (input: OpenAICompletionInput): Promise<OpenAICompletionResult> => {
   input.onEvent?.({ type: 'status', text: 'Streaming response...' });
 
-  const client = createClient(input.apiKey, { baseUrl: input.baseUrl });
+  const client = createClient(input.apiKey, { baseUrl: input.baseUrl, defaultHeaders: input.extraHeaders });
   const messages = input.history.map((message) => ({
     role: mapRoleForChatCompletions(message.role),
     content: message.content
@@ -499,7 +505,7 @@ const runOpenAICompatibleChatStreaming = async (input: OpenAICompletionInput): P
 const runOpenAIBackground = async (input: OpenAICompletionInput): Promise<OpenAICompletionResult> => {
   input.onEvent?.({ type: 'status', text: 'Queued in background...' });
 
-  const client = createClient(input.apiKey, { baseUrl: input.baseUrl });
+  const client = createClient(input.apiKey, { baseUrl: input.baseUrl, defaultHeaders: input.extraHeaders });
   const baseRequest = createRequestBody(input);
   const pollIntervalMs = Math.max(500, Math.trunc(input.backgroundPollIntervalMs ?? DEFAULT_BACKGROUND_POLL_INTERVAL_MS));
 
@@ -675,9 +681,10 @@ export const createOpenAICompletion = async (input: OpenAICompletionInput): Prom
 
 export const testOpenAIConnection = async (
   apiKey: string,
-  baseUrl?: string
-): Promise<{ ok: boolean; status: number }> => {
-  const client = createClient(apiKey, { baseUrl });
+  baseUrl?: string,
+  defaultHeaders?: Record<string, string>
+): Promise<{ ok: boolean; status: number; reason?: string }> => {
+  const client = createClient(apiKey, { baseUrl, defaultHeaders });
 
   try {
     await client.models.list();
@@ -689,21 +696,27 @@ export const testOpenAIConnection = async (
     if (error instanceof APIError) {
       return {
         ok: false,
-        status: error.status ?? 0
+        status: error.status ?? 0,
+        reason: error.message
       };
     }
 
     return {
       ok: false,
-      status: 0
+      status: 0,
+      reason: asErrorMessage(error)
     };
   }
 };
 
 const isUsefulModelId = (modelId: string): boolean => /^(gpt|o\d|codex)/i.test(modelId);
 
-export const listOpenAIModels = async (apiKey: string, baseUrl?: string): Promise<string[]> => {
-  const client = createClient(apiKey, { baseUrl });
+export const listOpenAIModels = async (
+  apiKey: string,
+  baseUrl?: string,
+  defaultHeaders?: Record<string, string>
+): Promise<string[]> => {
+  const client = createClient(apiKey, { baseUrl, defaultHeaders });
 
   const page = await client.models.list().catch((error) => {
     throw new Error(asErrorMessage(error));

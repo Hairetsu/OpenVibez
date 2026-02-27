@@ -396,6 +396,9 @@ const runLocalOllamaNativeTools = async (input: Parameters<ProviderRunner>[0]): 
 }> => {
   const model = resolveOllamaModel(input.modelProfileId, input.requestedModelId);
   const workspacePath = input.workspace?.root_path;
+  const localTemperature = input.localOptions?.temperature;
+  const localMaxOutputTokens = input.localOptions?.maxOutputTokens;
+  const localNumCtx = input.localOptions?.numCtx;
 
   const systemPrompt = [
     'You are OpenVibez local coding assistant.',
@@ -442,6 +445,9 @@ const runLocalOllamaNativeTools = async (input: Parameters<ProviderRunner>[0]): 
       baseUrl: input.secret ?? undefined,
       model,
       messages: nativeHistory,
+      temperature: localTemperature,
+      maxOutputTokens: localMaxOutputTokens,
+      numCtx: localNumCtx,
       tools,
       signal: input.signal
     });
@@ -545,6 +551,9 @@ const runLocalOllamaProtocol: ProviderRunner = async (input) => {
 
   const model = resolveOllamaModel(input.modelProfileId, input.requestedModelId);
   const workspacePath = input.workspace?.root_path;
+  const localTemperature = input.localOptions?.temperature;
+  const localMaxOutputTokens = input.localOptions?.maxOutputTokens;
+  const localNumCtx = input.localOptions?.numCtx;
   const toolSystemMessage = buildLocalToolSystemPrompt({
     accessMode: input.accessMode,
     workspacePath,
@@ -570,6 +579,9 @@ const runLocalOllamaProtocol: ProviderRunner = async (input) => {
       baseUrl: input.secret ?? undefined,
       model,
       history: agentHistory,
+      temperature: localTemperature,
+      maxOutputTokens: localMaxOutputTokens,
+      numCtx: localNumCtx,
       stream: false,
       signal: input.signal
     });
@@ -634,6 +646,9 @@ const runLocalOllamaProtocol: ProviderRunner = async (input) => {
       baseUrl: input.secret ?? undefined,
       model,
       history: agentHistory,
+      temperature: localTemperature,
+      maxOutputTokens: localMaxOutputTokens,
+      numCtx: localNumCtx,
       stream: false,
       signal: input.signal
     });

@@ -26,10 +26,27 @@ import {
 import { getSecret } from '../services/keychain';
 import { createAnthropicCompletion } from '../services/providers/anthropic';
 import { createCodexCompletion } from '../services/providers/codex';
+import { createGeminiCompletion } from '../services/providers/gemini';
 import { createOllamaCompletion } from '../services/providers/ollama';
 import { createOpenAICompletion, getOpenAIBackgroundJobKind } from '../services/providers/openai';
-import { resolveAnthropicModel, resolveOllamaModel, resolveOpenAIModel } from '../services/runners/models';
-import { runAnthropic, runCodexSubscription, runLocalOllama, runOpenAI } from '../services/runners';
+import { createOpenRouterCompletion } from '../services/providers/openrouter';
+import {
+  resolveAnthropicModel,
+  resolveGeminiModel,
+  resolveGrokModel,
+  resolveOllamaModel,
+  resolveOpenAIModel,
+  resolveOpenRouterModel
+} from '../services/runners/models';
+import {
+  runAnthropic,
+  runCodexSubscription,
+  runGemini,
+  runGrok,
+  runLocalOllama,
+  runOpenAI,
+  runOpenRouter
+} from '../services/runners';
 import type { ProviderRunner, RunnerContext, RunnerEvent } from '../services/runners';
 import { logger } from '../util/logger';
 import {
@@ -96,6 +113,21 @@ const SESSION_TITLE_MAX_LENGTH = 80;
 const SESSION_TITLE_TEXT_WINDOW = 1000;
 const SESSION_TITLE_PLACEHOLDER = /^(new vibe session|new session|session\s+\d{1,2}:\d{2}(:\d{2})?\s*(am|pm)?)$/i;
 const openAIBaseUrlSettingKey = (providerId: string): string => `provider_openai_base_url:${providerId}`;
+const openAICompatibleProfileIdSettingKey = (providerId: string): string => `provider_openai_compatible_profile_id:${providerId}`;
+const openRouterPricingSettingKey = (providerId: string): string => `provider_openrouter_pricing:${providerId}`;
+const openRouterAppOriginSettingKey = (providerId: string): string => `provider_openrouter_app_origin:${providerId}`;
+const openRouterAppTitleSettingKey = (providerId: string): string => `provider_openrouter_app_title:${providerId}`;
+const ollamaTemperatureSettingKey = (providerId: string): string => `provider_ollama_temperature:${providerId}`;
+const ollamaMaxOutputTokensSettingKey = (providerId: string): string => `provider_ollama_max_output_tokens:${providerId}`;
+const ollamaNumCtxSettingKey = (providerId: string): string => `provider_ollama_num_ctx:${providerId}`;
+const GROK_API_BASE_URL = 'https://api.x.ai/v1';
+
+type OpenAICompatibleProfile = {
+  id: string;
+  name?: string;
+  baseUrl: string;
+  isDefault: boolean;
+};
 
 class RequestCancelledError extends Error {
   constructor(message = 'Request cancelled by user.') {
@@ -173,6 +205,97 @@ const clipForTitle = (value: string): string => {
     return compact;
   }
   return `${compact.slice(0, SESSION_TITLE_TEXT_WINDOW).trim()}...`;
+};
+
+const asCompatibleProfiles = (value: unknown): OpenAICompatibleProfile[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const profiles: OpenAICompatibleProfile[] = [];
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const item = entry as { id?: unknown; name?: unknown; baseUrl?: unknown; isDefault?: unknown };
+    if (typeof item.id !== 'string' || typeof item.baseUrl !== 'string') {
+      continue;
+    }
+
+    const id = item.id.trim();
+    const name = typeof item.name === 'string' ? item.name.trim() : '';
+    const baseUrl = item.baseUrl.trim();
+    if (!id || !baseUrl) {
+      continue;
+    }
+
+    profiles.push({
+      id,
+      ...(name ? { name } : {}),
+      baseUrl,
+      isDefault: item.isDefault === true
+    });
+  }
+
+  return profiles;
+};
+
+const resolveOpenAIBaseUrl = (providerId: string): string | undefined => {
+  const profiles = asCompatibleProfiles(getSetting('openai_compatible_profiles'));
+  const selectedProfileIdRaw = getSetting(openAICompatibleProfileIdSettingKey(providerId));
+  const selectedProfileId = typeof selectedProfileIdRaw === 'string' ? selectedProfileIdRaw.trim() : '';
+  if (selectedProfileId) {
+    const selected = profiles.find((profile) => profile.id === selectedProfileId);
+    if (selected?.baseUrl) {
+      return selected.baseUrl;
+    }
+  }
+
+  const explicitBaseUrlRaw = getSetting(openAIBaseUrlSettingKey(providerId));
+  const explicitBaseUrl = typeof explicitBaseUrlRaw === 'string' ? explicitBaseUrlRaw.trim() : '';
+  if (explicitBaseUrl) {
+    return explicitBaseUrl;
+  }
+
+  const defaultProfile = profiles.find((profile) => profile.isDefault);
+  return defaultProfile?.baseUrl;
+};
+
+const asOpenRouterPricingMap = (
+  value: unknown
+): Record<string, { promptPerToken: number; completionPerToken: number }> | undefined => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  const parsed: Record<string, { promptPerToken: number; completionPerToken: number }> = {};
+
+  for (const [modelId, rawPricing] of entries) {
+    if (!rawPricing || typeof rawPricing !== 'object' || Array.isArray(rawPricing)) {
+      continue;
+    }
+
+    const pricing = rawPricing as { promptPerToken?: unknown; completionPerToken?: unknown };
+    const prompt = typeof pricing.promptPerToken === 'number' && Number.isFinite(pricing.promptPerToken)
+      ? pricing.promptPerToken
+      : null;
+    const completion = typeof pricing.completionPerToken === 'number' && Number.isFinite(pricing.completionPerToken)
+      ? pricing.completionPerToken
+      : null;
+    if (prompt === null || completion === null || prompt < 0 || completion < 0) {
+      continue;
+    }
+
+    parsed[modelId] = {
+      promptPerToken: prompt,
+      completionPerToken: completion
+    };
+  }
+
+  return Object.keys(parsed).length > 0 ? parsed : undefined;
 };
 
 const emitStream = (
@@ -257,8 +380,7 @@ const generateSessionTitle = async (input: {
       return null;
     }
 
-    const baseUrlRaw = getSetting(openAIBaseUrlSettingKey(provider.id));
-    const baseUrl = typeof baseUrlRaw === 'string' && baseUrlRaw.trim() ? baseUrlRaw.trim() : undefined;
+    const baseUrl = resolveOpenAIBaseUrl(provider.id);
 
     const completion = await createOpenAICompletion({
       apiKey: secret,
@@ -267,6 +389,50 @@ const generateSessionTitle = async (input: {
       history,
       temperature: 0.2,
       maxOutputTokens: 24,
+      signal: input.signal
+    });
+
+    const title = sanitizeSessionTitle(completion.text);
+    return title || null;
+  }
+
+  if (provider.type === 'grok') {
+    if (!secret) {
+      return null;
+    }
+
+    const completion = await createOpenAICompletion({
+      apiKey: secret,
+      baseUrl: GROK_API_BASE_URL,
+      model: resolveGrokModel(input.modelProfileId, input.requestedModelId),
+      history,
+      temperature: 0.2,
+      maxOutputTokens: 24,
+      signal: input.signal
+    });
+
+    const title = sanitizeSessionTitle(completion.text);
+    return title || null;
+  }
+
+  if (provider.type === 'openrouter') {
+    if (!secret) {
+      return null;
+    }
+
+    const appOriginRaw = getSetting(openRouterAppOriginSettingKey(provider.id));
+    const appTitleRaw = getSetting(openRouterAppTitleSettingKey(provider.id));
+    const appOrigin = typeof appOriginRaw === 'string' && appOriginRaw.trim() ? appOriginRaw.trim() : undefined;
+    const appTitle = typeof appTitleRaw === 'string' && appTitleRaw.trim() ? appTitleRaw.trim() : undefined;
+    const pricingByModel = asOpenRouterPricingMap(getSetting(openRouterPricingSettingKey(provider.id)));
+
+    const completion = await createOpenRouterCompletion({
+      apiKey: secret,
+      model: resolveOpenRouterModel(input.modelProfileId, input.requestedModelId),
+      history,
+      appOrigin,
+      appTitle,
+      pricingByModel,
       signal: input.signal
     });
 
@@ -307,6 +473,24 @@ const generateSessionTitle = async (input: {
     return title || null;
   }
 
+  if (provider.type === 'gemini') {
+    if (!secret) {
+      return null;
+    }
+
+    const completion = await createGeminiCompletion({
+      apiKey: secret,
+      model: resolveGeminiModel(input.modelProfileId, input.requestedModelId),
+      history,
+      temperature: 0.2,
+      maxOutputTokens: 24,
+      signal: input.signal
+    });
+
+    const title = sanitizeSessionTitle(completion.text);
+    return title || null;
+  }
+
   return null;
 };
 
@@ -319,8 +503,20 @@ const runnerForProvider = (input: { providerType: string; authKind: string }): P
     return runOpenAI;
   }
 
+  if (input.providerType === 'grok') {
+    return runGrok;
+  }
+
+  if (input.providerType === 'openrouter') {
+    return runOpenRouter;
+  }
+
   if (input.providerType === 'anthropic') {
     return runAnthropic;
+  }
+
+  if (input.providerType === 'gemini') {
+    return runGemini;
   }
 
   if (input.providerType === 'local') {
@@ -394,19 +590,44 @@ const resolveCodexOptions = (): RunnerContext['codexOptions'] => {
 const resolveOpenAIOptions = (providerId: string): RunnerContext['openaiOptions'] => {
   const backgroundModeEnabled = getSetting('openai_background_mode_enabled') === true;
   const pollRaw = getSetting('openai_background_poll_interval_ms');
-  const baseUrlRaw = getSetting(openAIBaseUrlSettingKey(providerId));
 
   const backgroundPollIntervalMs =
     typeof pollRaw === 'number' && Number.isFinite(pollRaw) && pollRaw >= 500
       ? Math.trunc(pollRaw)
       : undefined;
 
-  const baseUrl = typeof baseUrlRaw === 'string' && baseUrlRaw.trim() ? baseUrlRaw.trim() : undefined;
-
   return {
-    baseUrl,
+    baseUrl: resolveOpenAIBaseUrl(providerId),
     backgroundModeEnabled,
     backgroundPollIntervalMs
+  };
+};
+
+const resolveOpenRouterOptions = (providerId: string): RunnerContext['openrouterOptions'] => {
+  const appOriginRaw = getSetting(openRouterAppOriginSettingKey(providerId));
+  const appTitleRaw = getSetting(openRouterAppTitleSettingKey(providerId));
+  return {
+    appOrigin: typeof appOriginRaw === 'string' && appOriginRaw.trim() ? appOriginRaw.trim() : undefined,
+    appTitle: typeof appTitleRaw === 'string' && appTitleRaw.trim() ? appTitleRaw.trim() : undefined,
+    pricingByModel: asOpenRouterPricingMap(getSetting(openRouterPricingSettingKey(providerId)))
+  };
+};
+
+const resolveLocalOptions = (providerId: string): RunnerContext['localOptions'] => {
+  const tempRaw = getSetting(ollamaTemperatureSettingKey(providerId));
+  const maxRaw = getSetting(ollamaMaxOutputTokensSettingKey(providerId));
+  const numCtxRaw = getSetting(ollamaNumCtxSettingKey(providerId));
+
+  const temperature = typeof tempRaw === 'number' && Number.isFinite(tempRaw) ? tempRaw : undefined;
+  const maxOutputTokens =
+    typeof maxRaw === 'number' && Number.isFinite(maxRaw) && maxRaw > 0 ? Math.trunc(maxRaw) : undefined;
+  const numCtx =
+    typeof numCtxRaw === 'number' && Number.isFinite(numCtxRaw) && numCtxRaw > 0 ? Math.trunc(numCtxRaw) : undefined;
+
+  return {
+    temperature,
+    maxOutputTokens,
+    numCtx
   };
 };
 
@@ -648,6 +869,7 @@ export const registerChatHandlers = (): void => {
     let assistantContent = '';
     let inputTokens: number | undefined;
     let outputTokens: number | undefined;
+    let completionCostMicrounits: number | undefined;
     let runErrorText: string | undefined;
 
     try {
@@ -688,7 +910,15 @@ export const registerChatHandlers = (): void => {
         history,
         accessMode: effectiveAccessMode,
         workspace,
-        openaiOptions: resolveOpenAIOptions(provider.id),
+        openaiOptions:
+          provider.type === 'grok'
+            ? {
+              baseUrl: GROK_API_BASE_URL,
+              backgroundModeEnabled: false
+            }
+            : resolveOpenAIOptions(provider.id),
+        openrouterOptions: resolveOpenRouterOptions(provider.id),
+        localOptions: resolveLocalOptions(provider.id),
         codexOptions: resolveCodexOptions(),
         signal: controller.signal,
         onEvent: (runnerEvent) => {
@@ -701,6 +931,7 @@ export const registerChatHandlers = (): void => {
       assistantContent = completion.text;
       inputTokens = completion.inputTokens;
       outputTokens = completion.outputTokens;
+      completionCostMicrounits = completion.costMicrounits;
     } catch (error) {
       if (isCancellationError(error)) {
         const partial = assistantContent.trim();
@@ -731,7 +962,8 @@ export const registerChatHandlers = (): void => {
         role: 'assistant',
         content: assistantContent,
         inputTokens,
-        outputTokens
+        outputTokens,
+        costMicrounits: completionCostMicrounits
       });
 
       completeAssistantRun({
@@ -780,7 +1012,7 @@ export const registerChatHandlers = (): void => {
         eventType: 'completion',
         inputTokens: inputTokens ?? Math.ceil(parsed.content.length / 4),
         outputTokens: outputTokens ?? Math.ceil(assistantMessage.content.length / 4),
-        costMicrounits: 0
+        costMicrounits: completionCostMicrounits ?? 0
       });
 
       emitStream(event, {

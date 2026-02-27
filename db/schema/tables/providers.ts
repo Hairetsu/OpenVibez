@@ -4,7 +4,7 @@ export const providers = sqliteTable(
   'providers',
   {
     id: text('id').primaryKey(),
-    type: text('type', { enum: ['openai', 'anthropic', 'local'] }).notNull(),
+    type: text('type', { enum: ['openai', 'anthropic', 'gemini', 'openrouter', 'grok', 'local'] }).notNull(),
     displayName: text('display_name').notNull(),
     authKind: text('auth_kind', { enum: ['api_key', 'oauth_subscription'] }).notNull(),
     keychainRef: text('keychain_ref'),

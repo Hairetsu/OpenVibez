@@ -10,7 +10,8 @@ const api: OpenVibezApi = {
     startSubscriptionLogin: (input) => ipcRenderer.invoke('provider:startSubscriptionLogin', input),
     getSubscriptionLoginState: () => ipcRenderer.invoke('provider:getSubscriptionLoginState'),
     listModels: (input) => ipcRenderer.invoke('provider:listModels', input),
-    refreshModels: (input) => ipcRenderer.invoke('provider:refreshModels', input)
+    refreshModels: (input) => ipcRenderer.invoke('provider:refreshModels', input),
+    localDiagnostics: (input) => ipcRenderer.invoke('provider:localDiagnostics', input)
   },
   session: {
     create: (input) => ipcRenderer.invoke('session:create', input),
