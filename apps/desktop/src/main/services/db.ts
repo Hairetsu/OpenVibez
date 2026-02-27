@@ -66,6 +66,19 @@ export type MessageRow = {
   created_at: number;
 };
 
+export type AssistantRunRow = {
+  id: string;
+  session_id: string;
+  client_request_id: string;
+  stream_id: string;
+  status: 'running' | 'completed' | 'failed';
+  user_message_id: string | null;
+  assistant_message_id: string | null;
+  error_text: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
 let sqlite: Database.Database | null = null;
 
 const now = (): number => Date.now();
@@ -173,6 +186,24 @@ const migrate = (db: Database.Database): void => {
     );
     CREATE INDEX IF NOT EXISTS idx_usage_provider_created ON usage_events(provider_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_usage_session_created ON usage_events(session_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS assistant_runs (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      client_request_id TEXT NOT NULL,
+      stream_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      user_message_id TEXT,
+      assistant_message_id TEXT,
+      error_text TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+      FOREIGN KEY(user_message_id) REFERENCES messages(id) ON DELETE SET NULL,
+      FOREIGN KEY(assistant_message_id) REFERENCES messages(id) ON DELETE SET NULL,
+      UNIQUE(session_id, client_request_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_assistant_runs_session_created ON assistant_runs(session_id, created_at);
 
     CREATE TABLE IF NOT EXISTS app_settings (
       key TEXT PRIMARY KEY,
@@ -388,6 +419,10 @@ export const listMessages = (sessionId: string): MessageRow[] => {
   return getDb().prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY seq ASC').all(sessionId) as MessageRow[];
 };
 
+export const getMessageById = (messageId: string): MessageRow | undefined => {
+  return getDb().prepare('SELECT * FROM messages WHERE id = ?').get(messageId) as MessageRow | undefined;
+};
+
 const getNextMessageSeq = (sessionId: string): number => {
   const row = getDb().prepare('SELECT COALESCE(MAX(seq), -1) as seq FROM messages WHERE session_id = ?').get(sessionId) as {
     seq: number;
@@ -428,6 +463,64 @@ export const addMessage = (input: {
   getDb().prepare('UPDATE sessions SET updated_at = ?, last_message_at = ? WHERE id = ?').run(ts, ts, input.sessionId);
 
   return getDb().prepare('SELECT * FROM messages WHERE id = ?').get(id) as MessageRow;
+};
+
+export const getAssistantRunByClientRequest = (input: {
+  sessionId: string;
+  clientRequestId: string;
+}): AssistantRunRow | undefined => {
+  return getDb()
+    .prepare('SELECT * FROM assistant_runs WHERE session_id = ? AND client_request_id = ?')
+    .get(input.sessionId, input.clientRequestId) as AssistantRunRow | undefined;
+};
+
+export const createAssistantRun = (input: {
+  sessionId: string;
+  clientRequestId: string;
+  streamId: string;
+}): AssistantRunRow => {
+  const ts = now();
+  const id = makeId('run');
+
+  getDb()
+    .prepare(
+      `INSERT INTO assistant_runs (
+        id, session_id, client_request_id, stream_id, status, user_message_id, assistant_message_id, error_text, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'running', NULL, NULL, NULL, ?, ?)`
+    )
+    .run(id, input.sessionId, input.clientRequestId, input.streamId, ts, ts);
+
+  return getDb().prepare('SELECT * FROM assistant_runs WHERE id = ?').get(id) as AssistantRunRow;
+};
+
+export const markAssistantRunUserMessage = (input: {
+  runId: string;
+  userMessageId: string;
+}): void => {
+  getDb()
+    .prepare('UPDATE assistant_runs SET user_message_id = ?, updated_at = ? WHERE id = ?')
+    .run(input.userMessageId, now(), input.runId);
+};
+
+export const completeAssistantRun = (input: {
+  runId: string;
+  assistantMessageId: string;
+  errorText?: string;
+}): void => {
+  getDb()
+    .prepare(
+      'UPDATE assistant_runs SET assistant_message_id = ?, status = ?, error_text = ?, updated_at = ? WHERE id = ?'
+    )
+    .run(input.assistantMessageId, 'completed', input.errorText ?? null, now(), input.runId);
+};
+
+export const failAssistantRun = (input: {
+  runId: string;
+  errorText: string;
+}): void => {
+  getDb()
+    .prepare('UPDATE assistant_runs SET status = ?, error_text = ?, updated_at = ? WHERE id = ?')
+    .run('failed', input.errorText, now(), input.runId);
 };
 
 export const getSetting = (key: string): unknown | null => {

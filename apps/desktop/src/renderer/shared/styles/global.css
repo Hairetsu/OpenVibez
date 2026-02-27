@@ -1,3 +1,5 @@
+@import "highlight.js/styles/github-dark.css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -66,5 +68,35 @@
 
   .trace-card {
     @apply rounded-lg border border-border/60 bg-background/30 px-3 py-2;
+  }
+
+  .markdown-text pre {
+    margin-top: 0.4rem;
+    margin-bottom: 0.4rem;
+  }
+
+  .markdown-text code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  }
+
+  .markdown-text table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.35rem 0;
+    font-size: 11px;
+  }
+
+  .markdown-text th,
+  .markdown-text td {
+    border: 1px solid hsl(var(--border) / 0.6);
+    padding: 0.25rem 0.4rem;
+    text-align: left;
+  }
+
+  .markdown-text blockquote {
+    border-left: 2px solid hsl(var(--primary) / 0.5);
+    margin: 0.3rem 0;
+    padding-left: 0.6rem;
+    color: hsl(var(--muted-foreground));
   }
 }

@@ -45,6 +45,7 @@ export const messageSendSchema = z.object({
   sessionId: z.string().min(1),
   content: z.string().min(1),
   streamId: z.string().min(1).optional(),
+  clientRequestId: z.string().min(1).optional(),
   modelId: z.string().min(1).optional(),
   accessMode: z.enum(['scoped', 'root']).optional(),
   workspaceId: z.string().min(1).optional()

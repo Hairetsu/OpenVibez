@@ -1,4 +1,5 @@
 export * from './tables/app_settings';
+export * from './tables/assistant_runs';
 export * from './tables/background_jobs';
 export * from './tables/messages';
 export * from './tables/model_profiles';

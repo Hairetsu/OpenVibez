@@ -1,3 +1,6 @@
+import OpenAI, { APIError } from 'openai';
+import type { ResponseCreateParamsNonStreaming, ResponseCreateParamsStreaming } from 'openai/resources/responses/responses';
+
 type HistoryMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
@@ -20,29 +23,36 @@ type OpenAICompletionResult = {
   outputTokens?: number;
 };
 
-const parseTextFromResponse = (payload: unknown): string => {
-  if (!payload || typeof payload !== 'object') {
-    return '';
+type ResponseInputItem = {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+};
+
+const mapRole = (role: HistoryMessage['role']): 'system' | 'user' | 'assistant' => {
+  if (role === 'tool') {
+    return 'assistant';
   }
 
-  const response = payload as {
-    output_text?: unknown;
-    output?: Array<{
-      content?: Array<{ text?: unknown }>;
-      text?: unknown;
-    }>;
-  };
+  return role;
+};
 
-  if (typeof response.output_text === 'string' && response.output_text.trim()) {
-    return response.output_text;
+const parseTextFromResponse = (payload: {
+  output_text?: string | null;
+  output?: Array<{
+    text?: string | null;
+    content?: Array<{ text?: string | null }>;
+  }>;
+}): string => {
+  if (typeof payload.output_text === 'string' && payload.output_text.trim()) {
+    return payload.output_text;
   }
 
-  if (!Array.isArray(response.output)) {
+  if (!Array.isArray(payload.output)) {
     return '';
   }
 
   const chunks: string[] = [];
-  for (const item of response.output) {
+  for (const item of payload.output) {
     if (typeof item?.text === 'string') {
       chunks.push(item.text);
     }
@@ -61,42 +71,47 @@ const parseTextFromResponse = (payload: unknown): string => {
   return chunks.join('\n').trim();
 };
 
-const parseUsage = (payload: unknown): { inputTokens?: number; outputTokens?: number } => {
-  if (!payload || typeof payload !== 'object') {
-    return {};
+const toFiniteNumber = (value: unknown): number | undefined => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
   }
 
-  const usage = (payload as { usage?: Record<string, unknown> }).usage;
-  if (!usage || typeof usage !== 'object') {
-    return {};
-  }
-
-  const toNumber = (value: unknown): number | undefined => {
-    if (typeof value === 'number' && Number.isFinite(value)) {
-      return value;
-    }
-
-    return undefined;
-  };
-
-  return {
-    inputTokens: toNumber(usage.input_tokens) ?? toNumber(usage.prompt_tokens),
-    outputTokens: toNumber(usage.output_tokens) ?? toNumber(usage.completion_tokens)
-  };
+  return undefined;
 };
 
-const mapRole = (role: HistoryMessage['role']): 'system' | 'user' | 'assistant' => {
-  if (role === 'tool') {
-    return 'assistant';
+const asErrorMessage = (error: unknown): string => {
+  if (error instanceof APIError) {
+    return error.message;
   }
 
-  return role;
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+
+  return 'OpenAI request failed.';
 };
 
-const createRequestBody = (input: OpenAICompletionInput): Record<string, unknown> => {
-  const body: Record<string, unknown> = {
+const createClient = (apiKey: string): OpenAI => {
+  return new OpenAI({
+    apiKey,
+    maxRetries: 2,
+    timeout: 60_000
+  });
+};
+
+const createRequestBody = (input: OpenAICompletionInput): {
+  model: string;
+  input: ResponseInputItem[];
+  temperature?: number;
+  max_output_tokens?: number;
+} => {
+  const body: {
+    model: string;
+    input: ResponseInputItem[];
+    temperature?: number;
+    max_output_tokens?: number;
+  } = {
     model: input.model,
-    stream: true,
     input: input.history.map((message) => ({
       role: mapRole(message.role),
       content: message.content
@@ -117,133 +132,76 @@ const createRequestBody = (input: OpenAICompletionInput): Record<string, unknown
 export const createOpenAICompletion = async (input: OpenAICompletionInput): Promise<OpenAICompletionResult> => {
   input.onEvent?.({ type: 'status', text: 'Streaming response...' });
 
-  const res = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${input.apiKey}`
-    },
-    signal: input.signal,
-    body: JSON.stringify(createRequestBody(input))
-  });
+  const client = createClient(input.apiKey);
+  const baseRequest = createRequestBody(input);
 
-  if (!res.ok) {
-    const payload = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
-    const reason = payload?.error?.message ?? `OpenAI request failed (${res.status})`;
-    throw new Error(reason);
-  }
-
-  if (!res.body) {
-    throw new Error('OpenAI response body is unavailable for streaming.');
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-
-  let buffer = '';
   let fullText = '';
   let model = input.model;
-  let usage: { inputTokens?: number; outputTokens?: number } = {};
+  let inputTokens: number | undefined;
+  let outputTokens: number | undefined;
 
-  const processData = (data: string): void => {
-    if (!data || data === '[DONE]') {
-      return;
-    }
-
-    let event: unknown;
-    try {
-      event = JSON.parse(data);
-    } catch {
-      return;
-    }
-
-    const parsed = event as {
-      type?: string;
-      delta?: string;
-      model?: string;
-      response?: {
-        model?: string;
-        usage?: Record<string, unknown>;
-        output_text?: string;
-      };
+  try {
+    const streamRequest: ResponseCreateParamsStreaming = {
+      ...baseRequest,
+      stream: true
     };
 
-    if (typeof parsed.model === 'string' && parsed.model.trim()) {
-      model = parsed.model;
-    }
+    const stream = await client.responses.create(
+      streamRequest,
+      {
+        signal: input.signal
+      }
+    );
 
-    if (parsed.type === 'response.output_text.delta' && typeof parsed.delta === 'string') {
-      fullText += parsed.delta;
-      input.onEvent?.({ type: 'assistant_delta', delta: parsed.delta });
-      return;
-    }
-
-    if (parsed.type === 'response.completed' && parsed.response) {
-      if (typeof parsed.response.model === 'string' && parsed.response.model.trim()) {
-        model = parsed.response.model;
+    for await (const event of stream) {
+      if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
+        fullText += event.delta;
+        input.onEvent?.({ type: 'assistant_delta', delta: event.delta });
+        continue;
       }
 
-      usage = parseUsage({ usage: parsed.response.usage });
+      if (event.type === 'response.completed') {
+        const response = event.response;
+        if (typeof response?.model === 'string' && response.model.trim()) {
+          model = response.model;
+        }
 
-      if (!fullText && typeof parsed.response.output_text === 'string' && parsed.response.output_text.trim()) {
-        fullText = parsed.response.output_text;
+        inputTokens = toFiniteNumber(response?.usage?.input_tokens);
+        outputTokens = toFiniteNumber(response?.usage?.output_tokens);
       }
     }
-  };
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-
-    let boundary = buffer.indexOf('\n\n');
-    while (boundary !== -1) {
-      const rawEvent = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-
-      const dataLines = rawEvent
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice('data:'.length).trim());
-
-      const dataPayload = dataLines.join('');
-      processData(dataPayload);
-      boundary = buffer.indexOf('\n\n');
-    }
+  } catch (error) {
+    throw new Error(asErrorMessage(error));
   }
 
-  const remaining = buffer
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith('data:'))
-    .map((line) => line.slice('data:'.length).trim())
-    .join('');
-
-  processData(remaining);
-
   if (!fullText.trim()) {
-    const fallback = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${input.apiKey}`
-      },
-      signal: input.signal,
-      body: JSON.stringify({ ...createRequestBody(input), stream: false })
-    });
+    const fallbackRequest: ResponseCreateParamsNonStreaming = {
+      ...baseRequest,
+      stream: false
+    };
 
-    const payload = (await fallback.json().catch(() => null)) as { error?: { message?: string } } | null;
-    if (!fallback.ok) {
-      const reason = payload?.error?.message ?? `OpenAI fallback request failed (${fallback.status})`;
-      throw new Error(reason);
+    const fallback = await client.responses
+      .create(fallbackRequest, {
+        signal: input.signal
+      })
+      .catch((error) => {
+        throw new Error(asErrorMessage(error));
+      });
+
+    if (typeof fallback.model === 'string' && fallback.model.trim()) {
+      model = fallback.model;
     }
 
-    fullText = parseTextFromResponse(payload);
-    usage = parseUsage(payload);
+    fullText = parseTextFromResponse({
+      output_text: fallback.output_text,
+      output: (fallback.output ?? []) as Array<{
+        text?: string | null;
+        content?: Array<{ text?: string | null }>;
+      }>
+    });
+
+    inputTokens = toFiniteNumber(fallback.usage?.input_tokens);
+    outputTokens = toFiniteNumber(fallback.usage?.output_tokens);
   }
 
   if (!fullText.trim()) {
@@ -253,48 +211,47 @@ export const createOpenAICompletion = async (input: OpenAICompletionInput): Prom
   return {
     text: fullText,
     model,
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens
+    inputTokens,
+    outputTokens
   };
 };
 
 export const testOpenAIConnection = async (apiKey: string): Promise<{ ok: boolean; status: number }> => {
-  const res = await fetch('https://api.openai.com/v1/models', {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${apiKey}`
-    }
-  });
+  const client = createClient(apiKey);
 
-  return {
-    ok: res.ok,
-    status: res.status
-  };
+  try {
+    await client.models.list();
+    return {
+      ok: true,
+      status: 200
+    };
+  } catch (error) {
+    if (error instanceof APIError) {
+      return {
+        ok: false,
+        status: error.status ?? 0
+      };
+    }
+
+    return {
+      ok: false,
+      status: 0
+    };
+  }
 };
 
 const isUsefulModelId = (modelId: string): boolean => /^(gpt|o\d|codex)/i.test(modelId);
 
 export const listOpenAIModels = async (apiKey: string): Promise<string[]> => {
-  const res = await fetch('https://api.openai.com/v1/models', {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${apiKey}`
-    }
+  const client = createClient(apiKey);
+
+  const page = await client.models.list().catch((error) => {
+    throw new Error(asErrorMessage(error));
   });
 
-  if (!res.ok) {
-    throw new Error(`OpenAI model list request failed (${res.status})`);
-  }
-
-  const payload = (await res.json().catch(() => null)) as
-    | {
-        data?: Array<{ id?: unknown }>;
-      }
-    | null;
-
-  const modelIds = (payload?.data ?? [])
+  const modelIds = page.data
     .map((entry) => (typeof entry.id === 'string' ? entry.id : ''))
     .filter((modelId) => modelId.length > 0 && isUsefulModelId(modelId));
 
-  return modelIds.sort((a, b) => a.localeCompare(b));
+  return [...new Set(modelIds)].sort((a, b) => a.localeCompare(b));
 };

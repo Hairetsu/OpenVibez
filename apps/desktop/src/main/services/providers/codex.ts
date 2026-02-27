@@ -156,6 +156,68 @@ const classifyAction = (itemType: string, itemName: string, text: string): Actio
   return 'generic';
 };
 
+const asRecord = (value: unknown): Record<string, unknown> | null => (
+  value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
+);
+
+const pickString = (record: Record<string, unknown>, keys: string[]): string => {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+  return '';
+};
+
+const pickOutputText = (value: unknown): string => {
+  if (typeof value === 'string' && value.trim()) {
+    return value.trim();
+  }
+
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => pickOutputText(entry))
+      .filter((entry) => entry.length > 0);
+    return parts.join('\n').trim();
+  }
+
+  const record = asRecord(value);
+  if (!record) {
+    return '';
+  }
+
+  const direct = pickString(record, ['text', 'message', 'output', 'content']);
+  if (direct) {
+    return direct;
+  }
+
+  const nested = pickOutputText(record.content ?? record.output ?? record.items);
+  return nested;
+};
+
+const extractArgsObject = (item: Record<string, unknown>): Record<string, unknown> | null => {
+  const args = item.arguments;
+  if (typeof args === 'string') {
+    try {
+      const parsed = JSON.parse(args) as unknown;
+      return asRecord(parsed);
+    } catch {
+      return null;
+    }
+  }
+
+  return asRecord(args);
+};
+
+const formatCommandTrace = (name: string, command: string, cwd: string): string => {
+  const label = name || 'command';
+  if (cwd) {
+    return `${label}:\n${command}\ncwd: ${cwd}`;
+  }
+  return `${label}:\n${command}`;
+};
+
 const extractItemText = (item: Record<string, unknown>): string => {
   const raw = item.text;
   if (typeof raw === 'string' && raw.trim()) {
@@ -173,26 +235,52 @@ const extractItemText = (item: Record<string, unknown>): string => {
   }
 
   const name = typeof item.name === 'string' ? item.name : '';
-  const args = item.arguments;
-  if (name && typeof args === 'string') {
-    try {
-      const parsed = JSON.parse(args) as Record<string, unknown>;
-      const filePath = parsed.path ?? parsed.file ?? parsed.filename;
-      if (typeof filePath === 'string') {
-        return `${name}: ${filePath}`;
-      }
-      const cmd = parsed.command ?? parsed.cmd;
-      if (typeof cmd === 'string') {
-        return `${name}: ${cmd}`;
-      }
-      const query = parsed.query ?? parsed.pattern ?? parsed.search;
-      if (typeof query === 'string') {
-        return `${name}: ${query}`;
-      }
-      return `${name}: ${args}`;
-    } catch {
-      return `${name}: ${args}`;
+  const argsObject = extractArgsObject(item);
+  if (argsObject) {
+    const command = pickString(argsObject, ['command', 'cmd', 'shell_command', 'script']);
+    const cwd = pickString(argsObject, ['cwd', 'working_directory', 'workdir']);
+    if (command) {
+      return formatCommandTrace(name, command, cwd);
     }
+
+    const filePath = pickString(argsObject, ['path', 'file', 'filename']);
+    if (filePath) {
+      return `${name || 'file'}: ${filePath}`;
+    }
+
+    const query = pickString(argsObject, ['query', 'pattern', 'search']);
+    if (query) {
+      return `${name || 'search'}: ${query}`;
+    }
+  }
+
+  const commandFromItem = pickString(item, ['command', 'cmd', 'shell_command']);
+  if (commandFromItem) {
+    const cwd = pickString(item, ['cwd', 'working_directory', 'workdir']);
+    return formatCommandTrace(name, commandFromItem, cwd);
+  }
+
+  const exitCode = item.exit_code;
+  if (typeof exitCode === 'number') {
+    const stdout = pickOutputText(item.stdout);
+    const stderr = pickOutputText(item.stderr);
+    const lines = [`exit: ${exitCode}`];
+    if (stdout) {
+      lines.push(`stdout:\n${stdout}`);
+    }
+    if (stderr) {
+      lines.push(`stderr:\n${stderr}`);
+    }
+    return lines.join('\n\n');
+  }
+
+  if (typeof item.arguments === 'string' && item.arguments.trim()) {
+    return name ? `${name}: ${item.arguments}` : item.arguments.trim();
+  }
+
+  const fallbackOutput = pickOutputText(item.output);
+  if (fallbackOutput) {
+    return fallbackOutput;
   }
 
   if (name) {

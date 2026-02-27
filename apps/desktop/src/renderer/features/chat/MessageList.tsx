@@ -2,6 +2,9 @@ import { useEffect, useMemo, useRef } from "react";
 import type { Message, MessageStreamTrace } from "../../../preload/types";
 import type { StreamTimelineEntry } from "./chat.store";
 import { cn } from "@/lib/utils";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
 import {
   CheckCircle2,
   ChevronRight,
@@ -99,11 +102,19 @@ const parseCommand = (
   text: string,
 ): { command: string; cwd: string | null } | null => {
   const lines = text.split(/\r?\n/);
-  if (lines.length < 2) return null;
-  if (!/^Step\s+\d+\s+command:\s*$/i.test(lines[0]?.trim() ?? "")) return null;
-  const cwdIdx = lines.findIndex((l, i) => i > 0 && /^cwd:\s*/i.test(l.trim()));
+  if (lines.length < 1) return null;
+  const header = lines[0]?.trim() ?? "";
+  const hasKnownHeader =
+    /^Step\s+\d+\s+command:\s*$/i.test(header) ||
+    /^command(?:_execution)?:\s*$/i.test(header) ||
+    /^\$ /.test(header);
+  if (!hasKnownHeader) return null;
+  const commandStart = /^\$ /.test(header) ? 0 : 1;
+  const cwdIdx = lines.findIndex(
+    (l, i) => i >= commandStart && /^cwd:\s*/i.test(l.trim()),
+  );
   const commandLines = lines
-    .slice(1, cwdIdx === -1 ? undefined : cwdIdx)
+    .slice(commandStart, cwdIdx === -1 ? undefined : cwdIdx)
     .map((l) => l.trimEnd())
     .filter((l) => l.trim());
   if (commandLines.length === 0) return null;
@@ -142,57 +153,127 @@ const summarizeAction = (trace: MessageStreamTrace): ActionSummary => {
   const kind = trace.actionKind;
 
   const checklist = parseChecklist(text);
-  if (checklist) return { type: 'checklist', items: checklist };
+  if (checklist) return { type: "checklist", items: checklist };
 
-  if (kind === 'file-edit' || kind === 'file-create' || kind === 'file-delete') {
+  if (
+    kind === "file-edit" ||
+    kind === "file-create" ||
+    kind === "file-delete"
+  ) {
     const patchEdits = parseFileEdits(text);
-    if (patchEdits) return { type: 'edited', files: patchEdits, raw: text };
+    if (patchEdits) return { type: "edited", files: patchEdits, raw: text };
     const files = extractFileLocations(text);
-    const verb = kind === 'file-create' ? 'add' : kind === 'file-delete' ? 'delete' : 'update';
+    const verb =
+      kind === "file-create"
+        ? "add"
+        : kind === "file-delete"
+          ? "delete"
+          : "update";
     if (files.length > 0) {
-      return { type: 'edited', files: files.map((f) => ({ path: f, verb, added: 0, removed: 0 })), raw: text };
+      return {
+        type: "edited",
+        files: files.map((f) => ({ path: f, verb, added: 0, removed: 0 })),
+        raw: text,
+      };
     }
-    return { type: 'edited', files: [{ path: text.split('\n')[0] ?? 'file', verb, added: 0, removed: 0 }], raw: text };
+    return {
+      type: "edited",
+      files: [
+        { path: text.split("\n")[0] ?? "file", verb, added: 0, removed: 0 },
+      ],
+      raw: text,
+    };
   }
 
-  if (kind === 'file-read') {
+  if (kind === "file-read") {
     const files = extractFileLocations(text);
-    return { type: 'explored', count: files.length || 1, detail: text, raw: text };
+    return {
+      type: "explored",
+      count: files.length || 1,
+      detail: text,
+      raw: text,
+    };
   }
 
-  if (kind === 'search') {
-    const searchLines = text.split(/\r?\n/).filter((l) => /search|grep|rg\s|find\s|Searched|list/i.test(l));
-    return { type: 'explored', count: Math.max(searchLines.length, 1), detail: text, raw: text };
+  if (kind === "search") {
+    const searchLines = text
+      .split(/\r?\n/)
+      .filter((l) => /search|grep|rg\s|find\s|Searched|list/i.test(l));
+    return {
+      type: "explored",
+      count: Math.max(searchLines.length, 1),
+      detail: text,
+      raw: text,
+    };
   }
 
-  if (kind === 'command') {
+  if (kind === "command") {
     const parsed = parseCommand(text);
-    if (parsed) return { type: 'command', command: parsed.command, cwd: parsed.cwd, raw: text };
-    const firstLine = text.split('\n')[0] ?? text;
-    return { type: 'command', command: firstLine, cwd: null, raw: text };
+    if (parsed)
+      return {
+        type: "command",
+        command: parsed.command,
+        cwd: parsed.cwd,
+        raw: text,
+      };
+    const firstLine = text.split("\n")[0] ?? text;
+    return { type: "command", command: firstLine, cwd: null, raw: text };
   }
 
-  if (kind === 'command-result') {
+  if (kind === "command-result") {
     const parsed = parseResult(text);
-    if (parsed) return { type: 'result', exit: parsed.exit, timedOut: parsed.timedOut, stdout: parsed.stdout, stderr: parsed.stderr };
-    return { type: 'result', exit: null, timedOut: false, stdout: text, stderr: null };
+    if (parsed)
+      return {
+        type: "result",
+        exit: parsed.exit,
+        timedOut: parsed.timedOut,
+        stdout: parsed.stdout,
+        stderr: parsed.stderr,
+      };
+    return {
+      type: "result",
+      exit: null,
+      timedOut: false,
+      stdout: text,
+      stderr: null,
+    };
   }
 
   const command = parseCommand(text);
-  if (command) return { type: 'command', command: command.command, cwd: command.cwd, raw: text };
+  if (command)
+    return {
+      type: "command",
+      command: command.command,
+      cwd: command.cwd,
+      raw: text,
+    };
 
   const result = parseResult(text);
-  if (result) return { type: 'result', exit: result.exit, timedOut: result.timedOut, stdout: result.stdout, stderr: result.stderr };
+  if (result)
+    return {
+      type: "result",
+      exit: result.exit,
+      timedOut: result.timedOut,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    };
 
   const fileEdits = parseFileEdits(text);
-  if (fileEdits) return { type: 'edited', files: fileEdits, raw: text };
+  if (fileEdits) return { type: "edited", files: fileEdits, raw: text };
 
   if (SEARCH_PATTERN.test(text)) {
-    const searchLines = text.split(/\r?\n/).filter((l) => /search|grep|rg\s|find\s|Searched/i.test(l));
-    return { type: 'explored', count: Math.max(searchLines.length, 1), detail: text, raw: text };
+    const searchLines = text
+      .split(/\r?\n/)
+      .filter((l) => /search|grep|rg\s|find\s|Searched/i.test(l));
+    return {
+      type: "explored",
+      count: Math.max(searchLines.length, 1),
+      detail: text,
+      raw: text,
+    };
   }
 
-  return { type: 'text', content: text, files: extractFileLocations(text) };
+  return { type: "text", content: text, files: extractFileLocations(text) };
 };
 
 const roleLabel = (role: Message["role"]): string => {
@@ -220,12 +301,18 @@ const buildTimelineGroups = (
         groups.push({ kind: "action", trace: entry.trace, text: "" });
       }
     } else {
-      const last = groups[groups.length - 1];
-      if (last && last.kind === "action" && !last.text) {
-        last.text = entry.content;
-      } else {
-        groups.push({ kind: "text", content: entry.content });
-      }
+      groups.push({ kind: "text", content: entry.content });
+    }
+  }
+
+  // If the stream ends in text->action due late action event delivery,
+  // keep the final action above the final prose block.
+  if (groups.length >= 2) {
+    const last = groups[groups.length - 1];
+    const prev = groups[groups.length - 2];
+    if (last.kind === "action" && prev.kind === "text") {
+      groups[groups.length - 2] = last;
+      groups[groups.length - 1] = prev;
     }
   }
 
@@ -233,8 +320,120 @@ const buildTimelineGroups = (
 };
 
 const basename = (filePath: string): string => {
-  const parts = filePath.split('/');
+  const parts = filePath.split("/");
   return parts[parts.length - 1] ?? filePath;
+};
+
+const ellipsizeMiddle = (value: string, max = 120): string => {
+  if (value.length <= max) {
+    return value;
+  }
+
+  const keep = Math.max(8, Math.floor((max - 1) / 2));
+  return `${value.slice(0, keep)}…${value.slice(value.length - keep)}`;
+};
+
+const splitCommandByTopLevelOperators = (command: string): string[] => {
+  const parts: string[] = [];
+  let buffer = "";
+  let singleQuote = false;
+  let doubleQuote = false;
+  let escaped = false;
+
+  const flushBuffer = () => {
+    const trimmed = buffer.trim();
+    if (trimmed) {
+      parts.push(trimmed);
+    }
+    buffer = "";
+  };
+
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i];
+
+    if (escaped) {
+      buffer += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      buffer += ch;
+      escaped = true;
+      continue;
+    }
+
+    if (!doubleQuote && ch === "'") {
+      singleQuote = !singleQuote;
+      buffer += ch;
+      continue;
+    }
+
+    if (!singleQuote && ch === '"') {
+      doubleQuote = !doubleQuote;
+      buffer += ch;
+      continue;
+    }
+
+    if (!singleQuote && !doubleQuote) {
+      const next = command[i + 1] ?? "";
+
+      if (ch === "&" && next === "&") {
+        flushBuffer();
+        parts.push("&&");
+        i += 1;
+        continue;
+      }
+
+      if (ch === "|" && next === "|") {
+        flushBuffer();
+        parts.push("||");
+        i += 1;
+        continue;
+      }
+
+      if (ch === "|" || ch === ";") {
+        flushBuffer();
+        parts.push(ch);
+        continue;
+      }
+    }
+
+    buffer += ch;
+  }
+
+  flushBuffer();
+  return parts;
+};
+
+const formatCommandForDisplay = (command: string): string => {
+  const pieces = splitCommandByTopLevelOperators(command);
+  if (pieces.length <= 1) {
+    return command;
+  }
+
+  let output = pieces[0] ?? "";
+  for (let i = 1; i < pieces.length; i += 2) {
+    const op = pieces[i];
+    const next = pieces[i + 1] ?? "";
+
+    if (!op || !next) {
+      continue;
+    }
+
+    if (op === ";") {
+      output += `;\n${next}`;
+    } else {
+      output += ` \\\n  ${op} ${next}`;
+    }
+  }
+
+  return output;
+};
+
+const commandPreview = (command: string): string => {
+  const compact = command.replace(/\s+/g, " ").trim();
+  return ellipsizeMiddle(compact, 120);
 };
 
 const BACKTICK_PATH = /`([^`]*(?:\/[^`]+|\.[a-z0-9]{1,10}))`/gi;
@@ -243,11 +442,84 @@ const extractInlineFiles = (text: string): string[] => {
   const matches: string[] = [];
   for (const m of text.matchAll(BACKTICK_PATH)) {
     const val = m[1]?.trim();
-    if (!val || /^https?:\/\//i.test(val) || val.includes(' ') || val.length > 120) continue;
+    if (
+      !val ||
+      /^https?:\/\//i.test(val) ||
+      val.includes(" ") ||
+      val.length > 120
+    )
+      continue;
     matches.push(val);
   }
   return [...new Set(matches)].slice(0, 12);
 };
+
+const MarkdownText = ({
+  content,
+  className,
+}: {
+  content: string;
+  className?: string;
+}) => (
+  <div className={cn("markdown-text", className)}>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeHighlight]}
+      components={{
+        p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+        ul: ({ children }) => (
+          <ul className="mb-2 list-disc pl-5 last:mb-0">{children}</ul>
+        ),
+        ol: ({ children }) => (
+          <ol className="mb-2 list-decimal pl-5 last:mb-0">{children}</ol>
+        ),
+        li: ({ children }) => <li className="mb-0.5">{children}</li>,
+        a: ({ href, children }) => (
+          <a
+            href={href}
+            className="text-sky-300 underline decoration-sky-400/40 underline-offset-2 hover:text-sky-200"
+          >
+            {children}
+          </a>
+        ),
+        code: ({ className: codeClassName, children }) => {
+          const raw = String(children);
+          const isBlock = raw.includes("\n");
+          if (!isBlock) {
+            return (
+              <code
+                className={cn(
+                  "rounded border border-border/40 bg-black/20 px-1 py-0.5 font-mono text-[11px] text-emerald-200/90",
+                  codeClassName,
+                )}
+              >
+                {children}
+              </code>
+            );
+          }
+
+          return (
+            <code
+              className={cn(
+                "block font-mono text-[11px] leading-relaxed",
+                codeClassName,
+              )}
+            >
+              {children}
+            </code>
+          );
+        },
+        pre: ({ children }) => (
+          <pre className="my-2 overflow-x-auto rounded-lg border border-border/30 bg-black/35 px-3 py-2">
+            {children}
+          </pre>
+        ),
+      }}
+    >
+      {content}
+    </ReactMarkdown>
+  </div>
+);
 
 export const MessageList = ({
   messages,
@@ -289,7 +561,7 @@ export const MessageList = ({
   }
 
   return (
-    <div className="scroll-soft relative flex-1 overflow-auto [background:radial-gradient(ellipse_at_0%_0%,hsl(var(--primary)/0.08),transparent_60%),radial-gradient(ellipse_at_100%_100%,hsl(var(--accent)/0.06),transparent_60%)] [background-attachment:fixed]">
+    <div className="scroll-soft relative flex-1 overflow-auto [background:radial-gradient(ellipse_at_0%_0%,hsl(var(--primary)/0.03),transparent_60%),radial-gradient(ellipse_at_100%_100%,hsl(var(--accent)/0.03),transparent_60%)] [background-attachment:fixed]">
       <div className="relative mx-auto max-w-4xl px-4 py-5">
         <div className="grid gap-3">
           {messages
@@ -298,9 +570,9 @@ export const MessageList = ({
               <article
                 key={message.id}
                 className={cn(
-                  "group max-w-[90%] animate-rise rounded-2xl border px-4 py-3 shadow-[0_14px_45px_hsl(var(--shadow)/0.25)]",
+                  "group max-w-[90%] rounded-2xl border px-4 py-3 shadow-[0_14px_45px_hsl(var(--shadow)/0.05)]",
                   message.role === "user"
-                    ? "ml-auto border-primary/[0.35] bg-primary/10"
+                    ? "ml-auto "
                     : "mr-auto border-border/60 bg-card/[0.65] backdrop-blur-sm",
                 )}
               >
@@ -316,27 +588,30 @@ export const MessageList = ({
                     {roleLabel(message.role)}
                   </span>
                 </div>
-                <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90">
-                  {message.content}
-                </p>
+                <MarkdownText
+                  content={message.content}
+                  className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90"
+                />
               </article>
             ))}
 
           {timelineGroups.map((group, index) => {
-            if (group.kind === 'text') {
+            if (group.kind === "text") {
               const inlineFiles = extractInlineFiles(group.content);
               return (
                 <div key={`tl-${index}`} className="animate-rise grid gap-1.5">
-                  <p className="whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/75">
-                    {group.content}
-                  </p>
+                  <MarkdownText
+                    content={group.content}
+                    className="whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/75"
+                  />
                   {inlineFiles.length > 0 && (
                     <details className="group/det rounded-lg border border-border/40 bg-card/40">
                       <summary className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-[12px]">
                         <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
                         <Search className="h-3 w-3 text-sky-400/70" />
                         <span className="text-foreground/70">
-                          Explored {inlineFiles.length} file{inlineFiles.length !== 1 ? 's' : ''}
+                          Explored {inlineFiles.length} file
+                          {inlineFiles.length !== 1 ? "s" : ""}
                         </span>
                       </summary>
                       <div className="flex flex-wrap gap-1.5 border-t border-border/30 px-3 py-2">
@@ -362,9 +637,10 @@ export const MessageList = ({
               return (
                 <div key={`tl-${index}`} className="animate-rise grid gap-1">
                   {group.text && (
-                    <p className="text-[12px] leading-relaxed text-foreground/75">
-                      {group.text}
-                    </p>
+                    <MarkdownText
+                      content={group.text}
+                      className="text-[12px] leading-relaxed text-foreground/75"
+                    />
                   )}
                   {summary.files.map((file) => (
                     <details
@@ -409,24 +685,29 @@ export const MessageList = ({
             }
 
             if (summary.type === "command") {
+              const formattedCommand = formatCommandForDisplay(summary.command);
+              const preview = commandPreview(
+                summary.command.split("\n")[0] ?? summary.command,
+              );
               return (
                 <div key={`tl-${index}`} className="animate-rise grid gap-1">
                   {group.text && (
-                    <p className="text-[12px] leading-relaxed text-foreground/75">
-                      {group.text}
-                    </p>
+                    <MarkdownText
+                      content={group.text}
+                      className="text-[12px] leading-relaxed text-foreground/75"
+                    />
                   )}
                   <details className="group/det rounded-lg border border-border/40 bg-card/40">
                     <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px]">
                       <ChevronRight className="h-3 w-3 text-foreground/40 transition-transform group-open/det:rotate-90" />
                       <TerminalSquare className="h-3 w-3 text-emerald-400/70" />
-                      <span className="truncate font-mono text-foreground/70">
-                        {summary.command.split("\n")[0]}
+                      <span className="min-w-0 flex-1 truncate font-mono text-foreground/70">
+                        {preview}
                       </span>
                     </summary>
                     <div className="border-t border-border/30 bg-black/20 px-3 py-2">
                       <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-emerald-200/80">
-                        <code>{summary.command}</code>
+                        <code>{formattedCommand}</code>
                       </pre>
                       {summary.cwd && (
                         <p className="mt-1.5 font-mono text-[10px] text-foreground/40">
@@ -488,9 +769,10 @@ export const MessageList = ({
               return (
                 <div key={`tl-${index}`} className="animate-rise grid gap-1">
                   {group.text && (
-                    <p className="text-[12px] leading-relaxed text-foreground/75">
-                      {group.text}
-                    </p>
+                    <MarkdownText
+                      content={group.text}
+                      className="text-[12px] leading-relaxed text-foreground/75"
+                    />
                   )}
                   <details className="group/det rounded-lg border border-border/40 bg-card/40">
                     <summary className="flex cursor-pointer items-center gap-2 px-3 py-2 text-[12px]">
@@ -543,14 +825,16 @@ export const MessageList = ({
             return (
               <div key={`tl-${index}`} className="animate-rise grid gap-1">
                 {group.text && (
-                  <p className="text-[12px] leading-relaxed text-foreground/75">
-                    {group.text}
-                  </p>
+                  <MarkdownText
+                    content={group.text}
+                    className="text-[12px] leading-relaxed text-foreground/75"
+                  />
                 )}
                 {summary.content && !group.text && (
-                  <p className="text-[12px] leading-relaxed text-foreground/75">
-                    {summary.content}
-                  </p>
+                  <MarkdownText
+                    content={summary.content}
+                    className="text-[12px] leading-relaxed text-foreground/75"
+                  />
                 )}
                 {summary.files.length > 0 && (
                   <div className="flex flex-wrap items-center gap-1.5">

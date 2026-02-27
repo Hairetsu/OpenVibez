@@ -1,26 +1,31 @@
 import { ipcMain, type IpcMainInvokeEvent } from 'electron';
-import { spawn } from 'node:child_process';
-import path from 'node:path';
 import {
   addMessage,
   archiveSession,
+  completeAssistantRun,
+  createAssistantRun,
   createSession,
-  getModelProfileById,
+  failAssistantRun,
+  getAssistantRunByClientRequest,
+  getMessageById,
   getProviderById,
-  getSetting,
   getSessionById,
   getWorkspaceById,
   listMessages,
   listSessions,
+  markAssistantRunUserMessage,
   markProviderUsed,
   recordUsageEvent,
   setSessionTitle,
   setSessionProvider
 } from '../services/db';
 import { getSecret } from '../services/keychain';
-import { createCodexCompletion, getCodexLoginStatus } from '../services/providers/codex';
+import { createCodexCompletion } from '../services/providers/codex';
 import { createOllamaCompletion } from '../services/providers/ollama';
 import { createOpenAICompletion } from '../services/providers/openai';
+import { resolveOllamaModel, resolveOpenAIModel } from '../services/runners/models';
+import { runCodexSubscription, runLocalOllama, runOpenAI } from '../services/runners';
+import type { ProviderRunner, RunnerContext, RunnerEvent } from '../services/runners';
 import { logger } from '../util/logger';
 import {
   messageCancelSchema,
@@ -81,17 +86,7 @@ const mapMessage = (row: {
   createdAt: row.created_at
 });
 
-const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
-const DEFAULT_OLLAMA_MODEL = 'llama3.2:latest';
 const HISTORY_WINDOW = 30;
-const LOCAL_TOOL_CALL_PREFIX = 'TOOL_CALL';
-const LOCAL_PLAN_PREFIX = 'PLAN';
-const LOCAL_STEP_DONE_PREFIX = 'STEP_DONE';
-const LOCAL_FINAL_PREFIX = 'FINAL';
-const MAX_LOCAL_TOOL_STEPS = 24;
-const SHELL_COMMAND_TIMEOUT_MS = 120_000;
-const SHELL_OUTPUT_LIMIT = 20_000;
-const MAX_LOCAL_PLAN_STEPS = 12;
 const SESSION_TITLE_MAX_LENGTH = 80;
 const SESSION_TITLE_TEXT_WINDOW = 1000;
 const SESSION_TITLE_PLACEHOLDER = /^(new vibe session|new session|session\s+\d{1,2}:\d{2}(:\d{2})?\s*(am|pm)?)$/i;
@@ -105,11 +100,13 @@ class RequestCancelledError extends Error {
 
 type InflightRequest = {
   streamId: string;
+  requestKey: string;
   controller: AbortController;
   cancel: () => void;
 };
 
 const inflightRequests = new Map<string, InflightRequest>();
+const inflightRequestKeys = new Map<string, string>();
 
 const isCancellationError = (error: unknown): boolean => {
   if (!error || typeof error !== 'object') {
@@ -189,41 +186,6 @@ const emitStream = (
   } catch {
     // Renderer might be navigating or closed.
   }
-};
-
-const resolveOpenAIModel = (modelProfileId: string | null, requestedModelId?: string): string => {
-  if (requestedModelId && requestedModelId.trim()) {
-    return requestedModelId;
-  }
-
-  if (modelProfileId) {
-    const profile = getModelProfileById(modelProfileId);
-    if (profile?.model_id) {
-      return profile.model_id;
-    }
-  }
-
-  const fromSettings = getSetting('default_model_id');
-  if (typeof fromSettings === 'string' && fromSettings.trim()) {
-    return fromSettings;
-  }
-
-  return DEFAULT_OPENAI_MODEL;
-};
-
-const resolveOllamaModel = (modelProfileId: string | null, requestedModelId?: string): string => {
-  if (requestedModelId && requestedModelId.trim()) {
-    return requestedModelId;
-  }
-
-  if (modelProfileId) {
-    const profile = getModelProfileById(modelProfileId);
-    if (profile?.model_id) {
-      return profile.model_id;
-    }
-  }
-
-  return DEFAULT_OLLAMA_MODEL;
 };
 
 const generateSessionTitle = async (input: {
@@ -319,334 +281,62 @@ const generateSessionTitle = async (input: {
   return null;
 };
 
-type LocalToolCall = {
-  name: 'run_shell';
-  arguments: {
-    command: string;
-    cwd?: string;
-  };
+const runnerForProvider = (input: { providerType: string; authKind: string }): ProviderRunner => {
+  if (input.authKind === 'oauth_subscription') {
+    return runCodexSubscription;
+  }
+
+  if (input.providerType === 'openai') {
+    return runOpenAI;
+  }
+
+  if (input.providerType === 'local') {
+    return runLocalOllama;
+  }
+
+  throw new Error(`Provider "${input.providerType}" is not wired yet in v1.`);
 };
 
-type LocalExecutionPlan = {
-  steps: string[];
-};
+const makeRequestKey = (sessionId: string, clientRequestId: string): string => `${sessionId}::${clientRequestId}`;
 
-type LocalStepDone = {
-  index: number;
-  note?: string;
-};
-
-type LocalFinal = {
-  message: string;
-};
-
-const buildLocalToolSystemPrompt = (input: {
-  accessMode: 'scoped' | 'root';
-  workspacePath?: string;
-}): string => {
-  const context = input.workspacePath
-    ? `Preferred working directory: ${input.workspacePath}`
-    : 'No workspace directory is selected.';
-
-  return [
-    'You are OpenVibez local coding assistant with autonomous CLI tool access.',
-    '',
-    'You MUST follow this protocol:',
-    `1) First response: ${LOCAL_PLAN_PREFIX} {"steps":["step 1","step 2",...]}`,
-    `2) During execution: respond with either ${LOCAL_TOOL_CALL_PREFIX} {...} or ${LOCAL_STEP_DONE_PREFIX} {"index":<1-based>,"note":"optional"}`,
-    `3) Only when every step is completed: ${LOCAL_FINAL_PREFIX} {"message":"final user response"}`,
-    '',
-    `When you need to execute a shell command, respond with exactly one line:`,
-    `${LOCAL_TOOL_CALL_PREFIX} {"name":"run_shell","arguments":{"command":"<shell command>","cwd":"<optional cwd>"}}`,
-    'No markdown, no extra text when calling a tool.',
-    '',
-    'Available tools:',
-    '- run_shell(command: string, cwd?: string): run a shell command and return stdout/stderr/exit code.',
-    '',
-    'Use tools whenever they help fulfill the request. You may call tools repeatedly until done.',
-    'Do not stop early. If the user asks to build/create/clone a project, produce actual project files, not only a directory or README.',
-    'Before finalizing, verify key outputs exist by running shell checks (for example ls/find/test commands).',
-    `Only return ${LOCAL_FINAL_PREFIX} after all planned steps are complete.`,
-    `Access mode: ${input.accessMode}.`,
-    context,
-    'After tool results are returned, either call another tool, mark a step complete, or finalize if everything is done.'
-  ].join('\n');
-};
-
-const parsePrefixedJson = (text: string, prefix: string): unknown | null => {
-  const trimmed = text.trim();
-  const prefixIndex = trimmed.indexOf(prefix);
-  if (prefixIndex === -1) {
-    return null;
-  }
-
-  const payloadText = trimmed.slice(prefixIndex + prefix.length).trim();
-  if (!payloadText) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(payloadText);
-  } catch {
-    return null;
-  }
-};
-
-const sanitizePlanSteps = (steps: string[]): string[] => {
-  const cleaned = steps
-    .map((step) => step.trim())
-    .filter((step, index, list) => step.length > 0 && list.indexOf(step) === index);
-
-  if (cleaned.length === 0) {
-    return ['Complete the user request end-to-end.'];
-  }
-
-  return cleaned.slice(0, MAX_LOCAL_PLAN_STEPS);
-};
-
-const parseLocalPlan = (text: string): LocalExecutionPlan | null => {
-  const payload = parsePrefixedJson(text, LOCAL_PLAN_PREFIX) as { steps?: unknown } | null;
-  if (!payload) {
-    return null;
-  }
-
-  if (!Array.isArray(payload.steps)) {
-    return null;
-  }
-
-  const steps = sanitizePlanSteps(payload.steps.filter((entry): entry is string => typeof entry === 'string'));
-  return { steps };
-};
-
-const parseLocalToolCall = (text: string): LocalToolCall | null => {
-  const payload = parsePrefixedJson(text, LOCAL_TOOL_CALL_PREFIX) as {
-    name?: unknown;
-    arguments?: { command?: unknown; cwd?: unknown };
-  } | null;
-  if (!payload) {
-    return null;
-  }
-
-  if (payload.name !== 'run_shell') {
-    return null;
-  }
-
-  const command = typeof payload.arguments?.command === 'string' ? payload.arguments.command.trim() : '';
-  if (!command) {
-    return null;
-  }
-
-  const cwd = typeof payload.arguments?.cwd === 'string' && payload.arguments.cwd.trim()
-    ? payload.arguments.cwd.trim()
-    : undefined;
-
-  return {
-    name: 'run_shell',
-    arguments: {
-      command,
-      cwd
-    }
-  };
-};
-
-const parseLocalStepDone = (text: string): LocalStepDone | null => {
-  const payload = parsePrefixedJson(text, LOCAL_STEP_DONE_PREFIX) as { index?: unknown; note?: unknown } | null;
-  if (!payload) {
-    return null;
-  }
-
-  const index = typeof payload.index === 'number' ? Math.trunc(payload.index) : Number.NaN;
-  if (!Number.isInteger(index) || index < 1) {
-    return null;
-  }
-
-  const note = typeof payload.note === 'string' && payload.note.trim() ? payload.note.trim() : undefined;
-  return { index, note };
-};
-
-const parseLocalFinal = (text: string): LocalFinal | null => {
-  const payload = parsePrefixedJson(text, LOCAL_FINAL_PREFIX) as { message?: unknown } | null;
-  if (!payload) {
-    return null;
-  }
-
-  const message = typeof payload.message === 'string' ? payload.message.trim() : '';
-  if (!message) {
-    return null;
-  }
-
-  return { message };
-};
-
-const formatChecklist = (steps: string[], completed: boolean[]): string => (
-  steps
-    .map((step, index) => `${completed[index] ? '[x]' : '[ ]'} ${index + 1}. ${step}`)
-    .join('\n')
-);
-
-const normalizeMacUsersPath = (value: string): string => (
-  process.platform === 'darwin' ? value.replace(/\/users\//gi, '/Users/') : value
-);
-
-const resolveToolCwd = (workspacePath: string | undefined, requestedCwd?: string): string => {
-  const base = workspacePath ?? process.cwd();
-  if (!requestedCwd || !requestedCwd.trim()) {
-    return base;
-  }
-
-  const candidate = normalizeMacUsersPath(requestedCwd.trim());
-  if (path.isAbsolute(candidate)) {
-    return path.resolve(candidate);
-  }
-
-  return path.resolve(base, candidate);
-};
-
-const appendLimited = (current: string, chunk: string): string => {
-  const next = current + chunk;
-  if (next.length <= SHELL_OUTPUT_LIMIT) {
-    return next;
-  }
-  return `${next.slice(0, SHELL_OUTPUT_LIMIT)}\n...[truncated]`;
-};
-
-const truncateForTrace = (value: string, max = 1200): string => {
-  if (!value) {
-    return '';
-  }
-  if (value.length <= max) {
-    return value;
-  }
-  return `${value.slice(0, max)}\n...[truncated]`;
-};
-
-const runShellCommand = async (input: {
-  command: string;
-  cwd: string;
-  signal: AbortSignal;
-}): Promise<{
-  ok: boolean;
-  command: string;
-  cwd: string;
-  exitCode: number | null;
-  timedOut: boolean;
-  stdout: string;
-  stderr: string;
-}> => {
-  throwIfAborted(input.signal);
-  const command = normalizeMacUsersPath(input.command);
-
-  return new Promise((resolve, reject) => {
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    let settled = false;
-
-    const child = spawn(command, {
-      cwd: input.cwd,
-      env: process.env,
-      shell: true
+const mapRunnerEventToStream = (
+  event: IpcMainInvokeEvent,
+  streamId: string,
+  sessionId: string,
+  input: RunnerEvent,
+  onDelta: (delta: string) => void
+): void => {
+  if (input.type === 'status') {
+    emitStream(event, {
+      streamId,
+      sessionId,
+      type: 'status',
+      text: input.text
     });
+    return;
+  }
 
-    const finish = (payload: {
-      ok: boolean;
-      exitCode: number | null;
-      timedOut: boolean;
-      stdout: string;
-      stderr: string;
-    }) => {
-      if (settled) return;
-      settled = true;
-      input.signal.removeEventListener('abort', onAbort);
-      resolve({
-        command,
-        cwd: input.cwd,
-        ...payload
-      });
-    };
-
-    const fail = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      input.signal.removeEventListener('abort', onAbort);
-      reject(error);
-    };
-
-    const onAbort = () => {
-      try {
-        child.kill('SIGTERM');
-        setTimeout(() => child.kill('SIGKILL'), 3000);
-      } catch {
-        // ignore process kill errors
+  if (input.type === 'trace') {
+    emitStream(event, {
+      streamId,
+      sessionId,
+      type: 'trace',
+      trace: {
+        traceKind: input.trace.traceKind,
+        text: input.trace.text,
+        actionKind: input.trace.actionKind
       }
-      fail(new RequestCancelledError());
-    };
-
-    input.signal.addEventListener('abort', onAbort, { once: true });
-
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 3000);
-    }, SHELL_COMMAND_TIMEOUT_MS);
-
-    child.stdout.on('data', (chunk) => {
-      stdout = appendLimited(stdout, String(chunk));
     });
+    return;
+  }
 
-    child.stderr.on('data', (chunk) => {
-      stderr = appendLimited(stderr, String(chunk));
-    });
-
-    child.on('error', (error) => {
-      clearTimeout(timeout);
-      fail(new Error(appendLimited(stderr, `\n${asMessage(error)}`).trim() || 'Shell command failed.'));
-    });
-
-    child.on('close', (exitCode) => {
-      clearTimeout(timeout);
-      finish({
-        ok: !timedOut && exitCode === 0,
-        exitCode,
-        timedOut,
-        stdout,
-        stderr
-      });
-    });
+  onDelta(input.delta);
+  emitStream(event, {
+    streamId,
+    sessionId,
+    type: 'text_delta',
+    text: input.delta
   });
-};
-
-const executeLocalToolCall = async (input: {
-  toolCall: LocalToolCall;
-  workspacePath?: string;
-  signal: AbortSignal;
-}): Promise<{
-  ok: boolean;
-  tool: 'run_shell';
-  command: string;
-  cwd: string;
-  exitCode: number | null;
-  timedOut: boolean;
-  stdout: string;
-  stderr: string;
-}> => {
-  const cwd = resolveToolCwd(input.workspacePath, input.toolCall.arguments.cwd);
-  const result = await runShellCommand({
-    command: input.toolCall.arguments.command,
-    cwd,
-    signal: input.signal
-  });
-
-  return {
-    ok: result.ok,
-    tool: 'run_shell',
-    command: result.command,
-    cwd: result.cwd,
-    exitCode: result.exitCode,
-    timedOut: result.timedOut,
-    stdout: result.stdout,
-    stderr: result.stderr
-  };
 };
 
 export const registerChatHandlers = (): void => {
@@ -702,10 +392,91 @@ export const registerChatHandlers = (): void => {
     }
 
     const streamId = parsed.streamId ?? makeStreamId();
+    const clientRequestId = (parsed.clientRequestId ?? streamId).trim();
+    const requestKey = makeRequestKey(parsed.sessionId, clientRequestId);
+
+    const existingRun = getAssistantRunByClientRequest({
+      sessionId: parsed.sessionId,
+      clientRequestId
+    });
+
+    if (existingRun?.user_message_id && existingRun.assistant_message_id) {
+      const userMessage = getMessageById(existingRun.user_message_id);
+      const assistantMessage = getMessageById(existingRun.assistant_message_id);
+      if (userMessage && assistantMessage) {
+        return {
+          userMessage: mapMessage(userMessage),
+          assistantMessage: mapMessage(assistantMessage),
+          session: mapSession(getSessionById(parsed.sessionId) ?? session)
+        };
+      }
+    }
+
+    if (existingRun && existingRun.status === 'running') {
+      const activeStreamId = inflightRequestKeys.get(requestKey) ?? existingRun.stream_id;
+      throw new Error(`Request already in progress for clientRequestId "${clientRequestId}" (stream ${activeStreamId}).`);
+    }
+
+    if (inflightRequestKeys.has(requestKey)) {
+      throw new Error(`Request already in progress for clientRequestId "${clientRequestId}".`);
+    }
+
+    const run = (() => {
+      try {
+        return createAssistantRun({
+          sessionId: parsed.sessionId,
+          clientRequestId,
+          streamId
+        });
+      } catch {
+        const fromRace = getAssistantRunByClientRequest({
+          sessionId: parsed.sessionId,
+          clientRequestId
+        });
+
+        if (!fromRace) {
+          throw new Error('Failed to create assistant run.');
+        }
+
+        if (fromRace.user_message_id && fromRace.assistant_message_id) {
+          const userMessage = getMessageById(fromRace.user_message_id);
+          const assistantMessage = getMessageById(fromRace.assistant_message_id);
+          if (userMessage && assistantMessage) {
+            return null;
+          }
+        }
+
+        throw new Error(`Request already in progress for clientRequestId "${clientRequestId}".`);
+      }
+    })();
+
+    if (!run) {
+      const replay = getAssistantRunByClientRequest({
+        sessionId: parsed.sessionId,
+        clientRequestId
+      });
+      if (!replay?.user_message_id || !replay.assistant_message_id) {
+        throw new Error('Unable to resolve idempotent replay for completed run.');
+      }
+
+      const userMessage = getMessageById(replay.user_message_id);
+      const assistantMessage = getMessageById(replay.assistant_message_id);
+      if (!userMessage || !assistantMessage) {
+        throw new Error('Unable to resolve idempotent replay messages.');
+      }
+
+      return {
+        userMessage: mapMessage(userMessage),
+        assistantMessage: mapMessage(assistantMessage),
+        session: mapSession(getSessionById(parsed.sessionId) ?? session)
+      };
+    }
+
     const controller = new AbortController();
 
     const inflight: InflightRequest = {
       streamId,
+      requestKey,
       controller,
       cancel: () => {
         if (!controller.signal.aborted) {
@@ -714,6 +485,7 @@ export const registerChatHandlers = (): void => {
       }
     };
     inflightRequests.set(streamId, inflight);
+    inflightRequestKeys.set(requestKey, streamId);
 
     emitStream(event, {
       streamId,
@@ -730,10 +502,12 @@ export const registerChatHandlers = (): void => {
       role: 'user',
       content: parsed.content
     });
+    markAssistantRunUserMessage({ runId: run.id, userMessageId: userMessage.id });
 
     let assistantContent = '';
     let inputTokens: number | undefined;
     let outputTokens: number | undefined;
+    let runErrorText: string | undefined;
 
     try {
       throwIfAborted(controller.signal);
@@ -747,378 +521,38 @@ export const registerChatHandlers = (): void => {
 
       const secret = await getSecret(provider.keychain_ref);
       throwIfAborted(controller.signal);
+
       const workspaceId = parsed.workspaceId ?? session.workspace_id ?? null;
-      const workspacePath = workspaceId ? getWorkspaceById(workspaceId)?.root_path : undefined;
+      const workspace = workspaceId ? getWorkspaceById(workspaceId) : undefined;
       const effectiveAccessMode = parsed.accessMode ?? 'scoped';
       const history = [...existingMessages, userMessage]
         .slice(-HISTORY_WINDOW)
         .map((message) => ({ role: message.role, content: message.content }));
 
-      if (provider.auth_kind === 'oauth_subscription') {
-        if (provider.type !== 'openai') {
-          throw new Error('Subscription auth is currently supported only for OpenAI providers.');
-        }
+      const runner = runnerForProvider({
+        providerType: provider.type,
+        authKind: provider.auth_kind
+      });
 
-        const login = await getCodexLoginStatus();
-        if (!login.loggedIn) {
-          throw new Error(
-            'ChatGPT subscription is not connected yet. Use Connect ChatGPT in Settings, then run Check Support.'
-          );
-        }
-
-        const completion = await createCodexCompletion({
-          history,
-          cwd: workspacePath,
-          model: parsed.modelId,
-          fullAccess: parsed.accessMode === 'root',
-          signal: controller.signal,
-          onEvent: (streamEvent) => {
-            if (streamEvent.type === 'status' && streamEvent.text) {
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'status',
-                text: streamEvent.text
-              });
-              return;
-            }
-
-            if (streamEvent.type === 'trace') {
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'trace',
-                trace: {
-                  traceKind: streamEvent.traceKind,
-                  text: streamEvent.text,
-                  actionKind: streamEvent.actionKind
-                }
-              });
-              return;
-            }
-
-            if (streamEvent.type === 'assistant_delta' && streamEvent.delta) {
-              assistantContent += streamEvent.delta;
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'text_delta',
-                text: streamEvent.delta
-              });
-            }
-          }
-        });
-
-        assistantContent = completion.text;
-        inputTokens = completion.inputTokens;
-        outputTokens = completion.outputTokens;
-      } else {
-        if (provider.type === 'openai') {
-          if (!secret) {
-            throw new Error('No API key stored for this provider yet.');
-          }
-
-          const completion = await createOpenAICompletion({
-            apiKey: secret,
-            model: resolveOpenAIModel(session.model_profile_id, parsed.modelId),
-            history,
-            signal: controller.signal,
-            onEvent: (streamEvent) => {
-              if (streamEvent.type === 'status' && streamEvent.text) {
-                emitStream(event, {
-                  streamId,
-                  sessionId: parsed.sessionId,
-                  type: 'status',
-                  text: streamEvent.text
-                });
-                return;
-              }
-
-              if (streamEvent.type === 'assistant_delta' && streamEvent.delta) {
-                assistantContent += streamEvent.delta;
-                emitStream(event, {
-                  streamId,
-                  sessionId: parsed.sessionId,
-                  type: 'text_delta',
-                  text: streamEvent.delta
-                });
-              }
-            }
+      const completion = await runner({
+        provider,
+        secret,
+        modelProfileId: session.model_profile_id,
+        requestedModelId: parsed.modelId,
+        history,
+        accessMode: effectiveAccessMode,
+        workspace,
+        signal: controller.signal,
+        onEvent: (runnerEvent) => {
+          mapRunnerEventToStream(event, streamId, parsed.sessionId, runnerEvent, (delta) => {
+            assistantContent += delta;
           });
-
-          assistantContent = completion.text;
-          inputTokens = completion.inputTokens;
-          outputTokens = completion.outputTokens;
-        } else if (provider.type === 'local') {
-          const model = resolveOllamaModel(session.model_profile_id, parsed.modelId);
-          const toolSystemMessage = buildLocalToolSystemPrompt({
-            accessMode: effectiveAccessMode,
-            workspacePath
-          });
-          const agentHistory = [{ role: 'system' as const, content: toolSystemMessage }, ...history];
-          let totalInputTokens = 0;
-          let totalOutputTokens = 0;
-          let finalResponse: string | null = null;
-          let plan: LocalExecutionPlan | null = null;
-          let completedSteps: boolean[] = [];
-
-          for (let attempt = 0; attempt < 2 && !plan; attempt += 1) {
-            throwIfAborted(controller.signal);
-            emitStream(event, {
-              streamId,
-              sessionId: parsed.sessionId,
-              type: 'status',
-              text: 'Planning checklist...'
-            });
-            emitStream(event, {
-              streamId,
-              sessionId: parsed.sessionId,
-              type: 'text_delta',
-              text: attempt === 0 ? 'Creating execution plan...\n' : 'Retrying plan format...\n'
-            });
-
-            const planningTurn = await createOllamaCompletion({
-              baseUrl: secret ?? undefined,
-              model,
-              history: agentHistory,
-              stream: false,
-              signal: controller.signal
-            });
-
-            totalInputTokens += planningTurn.inputTokens ?? 0;
-            totalOutputTokens += planningTurn.outputTokens ?? 0;
-
-            const parsedPlan = parseLocalPlan(planningTurn.text);
-            if (parsedPlan) {
-              plan = parsedPlan;
-              completedSteps = Array(plan.steps.length).fill(false);
-              agentHistory.push({ role: 'assistant', content: planningTurn.text });
-              agentHistory.push({
-                role: 'system',
-                content: `CHECKLIST\n${formatChecklist(plan.steps, completedSteps)}`
-              });
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'trace',
-                trace: {
-                  traceKind: 'plan',
-                  text: formatChecklist(plan.steps, completedSteps)
-                }
-              });
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'text_delta',
-                text: `Plan (${plan.steps.length} steps):\n${plan.steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}\n`
-              });
-            } else {
-              agentHistory.push({ role: 'assistant', content: planningTurn.text });
-              agentHistory.push({
-                role: 'system',
-                content: `Invalid protocol. Respond with ${LOCAL_PLAN_PREFIX} {"steps":[...]}.`
-              });
-            }
-          }
-
-          if (!plan) {
-            throw new Error('Local agent failed to produce a valid execution plan.');
-          }
-
-          for (let step = 0; step < MAX_LOCAL_TOOL_STEPS; step += 1) {
-            throwIfAborted(controller.signal);
-            const nextStepIndex = completedSteps.findIndex((done) => !done);
-            const activeStep = nextStepIndex === -1 ? plan.steps.length : nextStepIndex + 1;
-
-            emitStream(event, {
-              streamId,
-              sessionId: parsed.sessionId,
-              type: 'status',
-              text: nextStepIndex === -1 ? 'Finalizing...' : `Executing step ${activeStep}/${plan.steps.length}...`
-            });
-            emitStream(event, {
-              streamId,
-              sessionId: parsed.sessionId,
-              type: 'text_delta',
-              text: `\nIteration ${step + 1}: ${nextStepIndex === -1 ? 'finalization' : `step ${activeStep}`}\n`
-            });
-
-            agentHistory.push({
-              role: 'system',
-              content: `CHECKLIST\n${formatChecklist(plan.steps, completedSteps)}\nCurrent step: ${activeStep}`
-            });
-
-            const modelTurn = await createOllamaCompletion({
-              baseUrl: secret ?? undefined,
-              model,
-              history: agentHistory,
-              stream: false,
-              signal: controller.signal
-            });
-
-            totalInputTokens += modelTurn.inputTokens ?? 0;
-            totalOutputTokens += modelTurn.outputTokens ?? 0;
-
-            emitStream(event, {
-              streamId,
-              sessionId: parsed.sessionId,
-              type: 'trace',
-              trace: {
-                traceKind: 'action',
-                text: `Model turn ${step + 1}: ${truncateForTrace(modelTurn.text, 400)}`,
-                actionKind: 'generic'
-              }
-            });
-
-            const stepDone = parseLocalStepDone(modelTurn.text);
-            if (stepDone) {
-              if (stepDone.index > plan.steps.length) {
-                agentHistory.push({ role: 'assistant', content: modelTurn.text });
-                agentHistory.push({
-                  role: 'system',
-                  content: `Invalid ${LOCAL_STEP_DONE_PREFIX} index ${stepDone.index}. Use 1..${plan.steps.length}.`
-                });
-                continue;
-              }
-
-              completedSteps[stepDone.index - 1] = true;
-              const checklistText = formatChecklist(plan.steps, completedSteps);
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'trace',
-                trace: {
-                  traceKind: 'plan',
-                  text: checklistText
-                }
-              });
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'text_delta',
-                text: `Checked off step ${stepDone.index}: ${plan.steps[stepDone.index - 1]}\n`
-              });
-
-              agentHistory.push({ role: 'assistant', content: modelTurn.text });
-              agentHistory.push({
-                role: 'system',
-                content: `CHECKLIST_UPDATED\n${checklistText}`
-              });
-              continue;
-            }
-
-            const parsedFinal = parseLocalFinal(modelTurn.text);
-            if (parsedFinal) {
-              const allDone = completedSteps.every((done) => done);
-              if (!allDone) {
-                agentHistory.push({ role: 'assistant', content: modelTurn.text });
-                agentHistory.push({
-                  role: 'system',
-                  content: `Cannot finalize yet. Remaining checklist:\n${formatChecklist(plan.steps, completedSteps)}`
-                });
-                continue;
-              }
-
-              finalResponse = parsedFinal.message;
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'trace',
-                trace: {
-                  traceKind: 'plan',
-                  text: `All ${plan.steps.length} steps complete.`
-                }
-              });
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'text_delta',
-                text: `${finalResponse}\n`
-              });
-              break;
-            }
-
-            const toolCall = parseLocalToolCall(modelTurn.text);
-            if (toolCall) {
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'trace',
-                trace: {
-                  traceKind: 'action',
-                  text: `Step ${activeStep} command:\n${toolCall.arguments.command}\ncwd: ${toolCall.arguments.cwd ?? workspacePath ?? process.cwd()}`,
-                  actionKind: 'command'
-                }
-              });
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'status',
-                text: 'Running command...'
-              });
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'text_delta',
-                text: `$ ${toolCall.arguments.command}\n`
-              });
-
-              const toolResult = await executeLocalToolCall({
-                toolCall,
-                workspacePath,
-                signal: controller.signal
-              });
-
-              const traceResultLines = [
-                `exit: ${toolResult.exitCode ?? 'n/a'}${toolResult.timedOut ? ' (timeout)' : ''}`,
-                toolResult.stdout ? `stdout:\n${truncateForTrace(toolResult.stdout)}` : '',
-                toolResult.stderr ? `stderr:\n${truncateForTrace(toolResult.stderr)}` : ''
-              ].filter((line) => line.length > 0);
-
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'trace',
-                trace: {
-                  traceKind: 'action',
-                  text: traceResultLines.join('\n\n'),
-                  actionKind: 'command-result'
-                }
-              });
-              emitStream(event, {
-                streamId,
-                sessionId: parsed.sessionId,
-                type: 'text_delta',
-                text: `exit ${toolResult.exitCode ?? 'n/a'}${toolResult.timedOut ? ' (timeout)' : ''}\n`
-              });
-
-              agentHistory.push({ role: 'assistant', content: modelTurn.text });
-              agentHistory.push({
-                role: 'system',
-                content: `TOOL_RESULT ${JSON.stringify(toolResult)}`
-              });
-              continue;
-            }
-
-            agentHistory.push({ role: 'assistant', content: modelTurn.text });
-            agentHistory.push({
-              role: 'system',
-              content:
-                `Invalid protocol response. Use ${LOCAL_TOOL_CALL_PREFIX}, ${LOCAL_STEP_DONE_PREFIX}, or ${LOCAL_FINAL_PREFIX}.`
-            });
-          }
-
-          if (!finalResponse || !finalResponse.trim()) {
-            throw new Error(`Local agent reached max tool steps (${MAX_LOCAL_TOOL_STEPS}) without finishing.`);
-          }
-
-          assistantContent = finalResponse;
-          inputTokens = totalInputTokens > 0 ? totalInputTokens : undefined;
-          outputTokens = totalOutputTokens > 0 ? totalOutputTokens : undefined;
-        } else {
-          throw new Error(`Provider "${provider.type}" is not wired yet in v1.`);
         }
-      }
+      } satisfies RunnerContext);
+
+      assistantContent = completion.text;
+      inputTokens = completion.inputTokens;
+      outputTokens = completion.outputTokens;
     } catch (error) {
       if (isCancellationError(error)) {
         const partial = assistantContent.trim();
@@ -1133,6 +567,7 @@ export const registerChatHandlers = (): void => {
         const message = asMessage(error);
         logger.error('Completion request failed', { sessionId: parsed.sessionId, message });
         assistantContent = `Provider request failed: ${message}`;
+        runErrorText = assistantContent;
         emitStream(event, {
           streamId,
           sessionId: parsed.sessionId,
@@ -1149,6 +584,12 @@ export const registerChatHandlers = (): void => {
         content: assistantContent,
         inputTokens,
         outputTokens
+      });
+
+      completeAssistantRun({
+        runId: run.id,
+        assistantMessageId: assistantMessage.id,
+        errorText: runErrorText
       });
 
       let latestSession = getSessionById(parsed.sessionId) ?? session;
@@ -1200,15 +641,22 @@ export const registerChatHandlers = (): void => {
         type: 'done'
       });
 
-      logger.info('message.send', { sessionId: parsed.sessionId, streamId });
+      logger.info('message.send', { sessionId: parsed.sessionId, streamId, clientRequestId });
 
       return {
         userMessage: mapMessage(userMessage),
         assistantMessage: mapMessage(assistantMessage),
         session: mapSession(latestSession)
       };
+    } catch (error) {
+      failAssistantRun({
+        runId: run.id,
+        errorText: asMessage(error)
+      });
+      throw error;
     } finally {
       inflightRequests.delete(streamId);
+      inflightRequestKeys.delete(requestKey);
     }
   });
 };

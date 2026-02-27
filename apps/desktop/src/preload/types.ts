@@ -107,6 +107,7 @@ export type OpenVibezApi = {
       sessionId: string;
       content: string;
       streamId?: string;
+      clientRequestId?: string;
       modelId?: string;
       accessMode?: MessageAccessMode;
       workspaceId?: string;

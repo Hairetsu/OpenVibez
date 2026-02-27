@@ -23,17 +23,18 @@ export const App = () => {
 
   const visibleSessions = store.sessions.filter((session) => session.workspaceId === store.selectedWorkspaceId);
   const selectedSessionTraces = store.selectedSessionId ? (store.sessionTracesById[store.selectedSessionId] ?? []) : [];
+  const selectedSessionTimeline = store.selectedSessionId ? (store.sessionTimelineById[store.selectedSessionId] ?? []) : [];
   const selectedSessionStatuses = store.selectedSessionId
     ? (store.sessionStatusesById[store.selectedSessionId] ?? [])
     : [];
   const visibleStream =
-    store.selectedSessionId && store.streaming.sessionId === store.selectedSessionId
+    store.selectedSessionId && store.streaming.active && store.streaming.sessionId === store.selectedSessionId
       ? store.streaming
       : {
           active: false,
           text: '',
           traces: selectedSessionTraces,
-          timeline: [],
+          timeline: selectedSessionTimeline,
           status: selectedSessionStatuses[selectedSessionStatuses.length - 1] ?? null,
           statusTrail: selectedSessionStatuses
         };

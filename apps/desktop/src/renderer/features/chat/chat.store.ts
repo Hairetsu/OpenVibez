@@ -44,6 +44,7 @@ type ChatState = {
   usageSummary: { inputTokens: number; outputTokens: number; costMicrounits: number } | null;
   sessionTracesById: Record<string, MessageStreamTrace[]>;
   sessionStatusesById: Record<string, string[]>;
+  sessionTimelineById: Record<string, StreamTimelineEntry[]>;
   streaming: StreamingState;
   initialize: () => Promise<void>;
   createProvider: (input: { displayName: string; authKind: Provider['authKind']; type?: Provider['type'] }) => Promise<void>;
@@ -65,6 +66,7 @@ type ChatState = {
 
 const DEFAULT_MODEL_ID = 'gpt-4o-mini';
 const CANCEL_WAIT_TIMEOUT_MS = 4000;
+const sessionTimelineKey = (sessionId: string): string => `session_timeline:${sessionId}`;
 
 let streamUnsubscribe: (() => void) | null = null;
 
@@ -134,6 +136,78 @@ const appendStatus = (statuses: string[], nextStatus: string | null | undefined)
   return [...statuses, normalized];
 };
 
+const isActionKind = (value: unknown): value is MessageStreamTrace['actionKind'] => {
+  return (
+    value === 'file-edit' ||
+    value === 'file-read' ||
+    value === 'file-create' ||
+    value === 'file-delete' ||
+    value === 'search' ||
+    value === 'command' ||
+    value === 'command-result' ||
+    value === 'generic'
+  );
+};
+
+const asTimelineEntry = (value: unknown): StreamTimelineEntry | null => {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const item = value as { type?: unknown; trace?: unknown; content?: unknown };
+  if (item.type === 'text' && typeof item.content === 'string') {
+    return { type: 'text', content: item.content };
+  }
+
+  if (item.type === 'trace' && item.trace && typeof item.trace === 'object') {
+    const trace = item.trace as { traceKind?: unknown; text?: unknown; actionKind?: unknown };
+    if (
+      (trace.traceKind === 'thought' || trace.traceKind === 'plan' || trace.traceKind === 'action') &&
+      typeof trace.text === 'string'
+    ) {
+      return {
+        type: 'trace',
+        trace: {
+          traceKind: trace.traceKind,
+          text: trace.text,
+          actionKind: isActionKind(trace.actionKind) ? trace.actionKind : undefined
+        }
+      };
+    }
+  }
+
+  return null;
+};
+
+const normalizeTimeline = (value: unknown): StreamTimelineEntry[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => asTimelineEntry(entry))
+    .filter((entry): entry is StreamTimelineEntry => Boolean(entry));
+};
+
+const tracesFromTimeline = (timeline: StreamTimelineEntry[]): MessageStreamTrace[] => {
+  return timeline
+    .filter((entry): entry is Extract<StreamTimelineEntry, { type: 'trace' }> => entry.type === 'trace')
+    .map((entry) => entry.trace);
+};
+
+const loadSessionTimeline = async (sessionId: string | null): Promise<StreamTimelineEntry[]> => {
+  if (!sessionId) {
+    return [];
+  }
+
+  const stored = await api.settings.get({ key: sessionTimelineKey(sessionId) });
+  return normalizeTimeline(stored);
+};
+
+const persistSessionTimeline = async (sessionId: string, timeline: StreamTimelineEntry[]): Promise<void> => {
+  await api.settings.set({ key: sessionTimelineKey(sessionId), value: timeline });
+};
+
 const ensureStreamListener = (
   set: (partial: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void,
   get: () => ChatState
@@ -173,17 +247,24 @@ const ensureStreamListener = (
 
     if (event.type === 'trace' && event.trace) {
       const trace = event.trace;
-      set((current) => ({
-        sessionTracesById: {
-          ...current.sessionTracesById,
-          [event.sessionId]: [...(current.sessionTracesById[event.sessionId] ?? []), trace]
-        },
-        streaming: {
-          ...current.streaming,
-          traces: [...(current.sessionTracesById[event.sessionId] ?? []), trace],
-          timeline: [...current.streaming.timeline, { type: 'trace', trace }]
-        }
-      }));
+      set((current) => {
+        const nextTimeline = [...current.streaming.timeline, { type: 'trace', trace } as StreamTimelineEntry];
+        return {
+          sessionTracesById: {
+            ...current.sessionTracesById,
+            [event.sessionId]: [...(current.sessionTracesById[event.sessionId] ?? []), trace]
+          },
+          sessionTimelineById: {
+            ...current.sessionTimelineById,
+            [event.sessionId]: nextTimeline
+          },
+          streaming: {
+            ...current.streaming,
+            traces: [...(current.sessionTracesById[event.sessionId] ?? []), trace],
+            timeline: nextTimeline
+          }
+        };
+      });
       return;
     }
 
@@ -198,6 +279,10 @@ const ensureStreamListener = (
           timeline.push({ type: 'text', content: delta });
         }
         return {
+          sessionTimelineById: {
+            ...current.sessionTimelineById,
+            [event.sessionId]: timeline
+          },
           streaming: {
             ...current.streaming,
             text: `${current.streaming.text}${delta}`,
@@ -269,6 +354,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   usageSummary: null,
   sessionTracesById: {},
   sessionStatusesById: {},
+  sessionTimelineById: {},
   streaming: {
     active: false,
     streamId: null,
@@ -307,6 +393,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const selectedSessionId = sessions[0]?.id ?? null;
     const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
     const messages = selectedSessionId ? await api.message.list({ sessionId: selectedSessionId }) : [];
+    const selectedTimeline = await loadSessionTimeline(selectedSessionId);
     const providerFromSettings =
       typeof defaultProvider === 'string' && defaultProvider.trim() ? defaultProvider.trim() : null;
     const selectedProviderId = pickProviderId(nextProviders, selectedSession?.providerId ?? providerFromSettings);
@@ -328,6 +415,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       selectedWorkspaceId,
       messages,
       usageSummary,
+      sessionTimelineById: selectedSessionId ? { [selectedSessionId]: selectedTimeline } : {},
+      sessionTracesById: selectedSessionId ? { [selectedSessionId]: tracesFromTimeline(selectedTimeline) } : {},
       selectedModelId: pickModelId(modelProfiles, typeof defaultModel === 'string' ? defaultModel : undefined)
     });
   },
@@ -381,7 +470,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   selectSession: async (sessionId: string) => {
-    const messages = await api.message.list({ sessionId });
+    const [messages, timeline] = await Promise.all([api.message.list({ sessionId }), loadSessionTimeline(sessionId)]);
     const session = get().sessions.find((value) => value.id === sessionId) ?? null;
     const modelProfiles = await loadModelsForProvider(session?.providerId ?? null);
 
@@ -390,6 +479,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       selectedProviderId: session?.providerId ?? get().selectedProviderId,
       messages,
       selectedWorkspaceId: session ? session.workspaceId : get().selectedWorkspaceId,
+      sessionTimelineById: {
+        ...get().sessionTimelineById,
+        [sessionId]: timeline
+      },
+      sessionTracesById: {
+        ...get().sessionTracesById,
+        [sessionId]: tracesFromTimeline(timeline)
+      },
       modelProfiles,
       selectedModelId: pickModelId(modelProfiles, get().selectedModelId)
     });
@@ -435,9 +532,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     const streamId = `stream_${nanoid(10)}`;
+    const clientRequestId = `req_${nanoid(12)}`;
+    const optimisticUserMessageId = `tmp_user_${clientRequestId}`;
+    const optimisticUserMessage: Message = {
+      id: optimisticUserMessageId,
+      sessionId: activeSessionId,
+      role: 'user',
+      content: trimmed,
+      contentFormat: 'markdown',
+      toolName: null,
+      toolCallId: null,
+      seq: -1,
+      inputTokens: null,
+      outputTokens: null,
+      costMicrounits: null,
+      createdAt: Date.now()
+    };
+
     set((state) => ({
+      messages:
+        state.selectedSessionId === activeSessionId
+          ? [...state.messages, optimisticUserMessage]
+          : state.messages,
       sessionTracesById: {
         ...state.sessionTracesById,
+        [activeSessionId]: []
+      },
+      sessionTimelineById: {
+        ...state.sessionTimelineById,
         [activeSessionId]: []
       },
       sessionStatusesById: {
@@ -456,39 +578,62 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
     }));
 
-    const sent = await api.message.send({
-      sessionId: activeSessionId,
-      content: trimmed,
-      streamId,
-      modelId: get().selectedModelId,
-      accessMode: get().accessMode,
-      workspaceId: get().selectedWorkspaceId ?? undefined
-    });
+    try {
+      const sent = await api.message.send({
+        sessionId: activeSessionId,
+        content: trimmed,
+        streamId,
+        clientRequestId,
+        modelId: get().selectedModelId,
+        accessMode: get().accessMode,
+        workspaceId: get().selectedWorkspaceId ?? undefined
+      });
 
-    const updatedSession = sent.session;
+      const updatedSession = sent.session;
 
-    set((state) => {
-      const sessions = updatedSession
-        ? [updatedSession, ...state.sessions.filter((session) => session.id !== updatedSession.id)]
-        : state.sessions;
-      const keepCurrentMessages = state.selectedSessionId !== activeSessionId;
+      set((state) => {
+        const sessions = updatedSession
+          ? [updatedSession, ...state.sessions.filter((session) => session.id !== updatedSession.id)]
+          : state.sessions;
+        const keepCurrentMessages = state.selectedSessionId !== activeSessionId;
+        const withoutOptimistic = state.messages.filter((message) => message.id !== optimisticUserMessageId);
 
-      return {
-        messages: keepCurrentMessages ? state.messages : [...state.messages, sent.userMessage, sent.assistantMessage],
-        sessions,
+        return {
+          messages: keepCurrentMessages ? state.messages : [...withoutOptimistic, sent.userMessage, sent.assistantMessage],
+          sessions,
+          streaming:
+            state.streaming.streamId === streamId
+              ? {
+                  ...state.streaming,
+                  active: false,
+                  status: state.streaming.status ?? 'Done'
+                }
+              : state.streaming
+        };
+      });
+
+      const usageSummary = await api.usage.summary({ days: 30 });
+      set({ usageSummary });
+      void persistSessionTimeline(activeSessionId, get().sessionTimelineById[activeSessionId] ?? []);
+    } catch (error) {
+      set((state) => ({
+        messages:
+          state.selectedSessionId === activeSessionId
+            ? state.messages.filter((message) => message.id !== optimisticUserMessageId)
+            : state.messages,
         streaming:
           state.streaming.streamId === streamId
             ? {
                 ...state.streaming,
                 active: false,
-                status: state.streaming.status ?? 'Done'
+                status: 'Error',
+                statusTrail: appendStatus(state.streaming.statusTrail, 'Error')
               }
             : state.streaming
-      };
-    });
-
-    const usageSummary = await api.usage.summary({ days: 30 });
-    set({ usageSummary });
+      }));
+      void persistSessionTimeline(activeSessionId, get().sessionTimelineById[activeSessionId] ?? []);
+      throw error;
+    }
   },
 
   cancelMessage: async () => {
