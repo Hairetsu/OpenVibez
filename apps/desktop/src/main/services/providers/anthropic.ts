@@ -3,6 +3,28 @@ type HistoryMessage = {
   content: string;
 };
 
+type AnthropicToolDefinition = {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+};
+
+type AnthropicToolCall = {
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+};
+
+type AnthropicToolContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+  | { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean };
+
+type AnthropicToolMessage = {
+  role: 'user' | 'assistant';
+  content: string | AnthropicToolContentBlock[];
+};
+
 type AnthropicCompletionInput = {
   apiKey: string;
   model: string;
@@ -16,6 +38,27 @@ type AnthropicCompletionInput = {
 type AnthropicCompletionResult = {
   text: string;
   model: string;
+  inputTokens?: number;
+  outputTokens?: number;
+};
+
+type AnthropicToolTurnInput = {
+  apiKey: string;
+  model: string;
+  system?: string;
+  messages: AnthropicToolMessage[];
+  tools: AnthropicToolDefinition[];
+  temperature?: number;
+  maxOutputTokens?: number;
+  signal?: AbortSignal;
+  onEvent?: (event: { type: 'status'; text?: string }) => void;
+};
+
+type AnthropicToolTurnResult = {
+  text: string;
+  model: string;
+  toolCalls: AnthropicToolCall[];
+  assistantMessage: AnthropicToolMessage;
   inputTokens?: number;
   outputTokens?: number;
 };
@@ -103,6 +146,85 @@ const anthropicHeaders = (apiKey: string): Record<string, string> => ({
   'x-api-key': apiKey,
   'anthropic-version': ANTHROPIC_VERSION
 });
+
+const mapToolMessagesToAnthropic = (messages: AnthropicToolMessage[]) => {
+  const mapped: Array<{
+    role: 'user' | 'assistant';
+    content:
+      | string
+      | Array<
+          | { type: 'text'; text: string }
+          | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+          | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean }
+        >;
+  }> = [];
+
+  for (const entry of messages) {
+    if (typeof entry.content === 'string') {
+      const content = entry.content.trim();
+      if (!content) {
+        continue;
+      }
+
+      mapped.push({
+        role: entry.role,
+        content
+      });
+      continue;
+    }
+
+    const content = entry.content
+      .map((block) => {
+        if (block.type === 'text') {
+          const text = block.text.trim();
+          return text ? { type: 'text' as const, text } : null;
+        }
+
+        if (block.type === 'tool_use') {
+          return {
+            type: 'tool_use' as const,
+            id: block.id,
+            name: block.name,
+            input: block.input
+          };
+        }
+
+        const text = block.content.trim();
+        return {
+          type: 'tool_result' as const,
+          tool_use_id: block.toolUseId,
+          content: text || '(no output)',
+          ...(block.isError ? { is_error: true } : {})
+        };
+      })
+      .filter(
+        (
+          block
+        ): block is
+          | { type: 'text'; text: string }
+          | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+          | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean } => Boolean(block)
+      );
+
+    if (content.length === 0) {
+      continue;
+    }
+
+    mapped.push({
+      role: entry.role,
+      content
+    });
+  }
+
+  if (mapped.length === 0 || mapped[0]?.role !== 'user') {
+    mapped.unshift({
+      role: 'user',
+      content: 'Continue.'
+    });
+  }
+
+  return mapped;
+};
 
 export const testAnthropicConnection = async (
   apiKey: string
@@ -229,6 +351,123 @@ export const createAnthropicCompletion = async (input: AnthropicCompletionInput)
   return {
     text,
     model,
+    inputTokens,
+    outputTokens
+  };
+};
+
+export const createAnthropicToolTurn = async (
+  input: AnthropicToolTurnInput
+): Promise<AnthropicToolTurnResult> => {
+  input.onEvent?.({ type: 'status', text: 'Running Anthropic tool turn...' });
+
+  const body: Record<string, unknown> = {
+    model: input.model,
+    max_tokens:
+      typeof input.maxOutputTokens === 'number' && Number.isFinite(input.maxOutputTokens)
+        ? Math.max(1, Math.trunc(input.maxOutputTokens))
+        : DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS,
+    messages: mapToolMessagesToAnthropic(input.messages),
+    tools: input.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.inputSchema
+    }))
+  };
+
+  if (input.system?.trim()) {
+    body.system = input.system.trim();
+  }
+
+  if (typeof input.temperature === 'number') {
+    body.temperature = input.temperature;
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${ANTHROPIC_API_BASE}/v1/messages`, {
+      method: 'POST',
+      headers: anthropicHeaders(input.apiKey),
+      body: JSON.stringify(body),
+      signal: input.signal
+    });
+  } catch (error) {
+    throw new Error(asErrorMessage(error));
+  }
+
+  if (!res.ok) {
+    throw new Error(await parseJsonError(res));
+  }
+
+  const payload = (await res.json().catch(() => null)) as
+    | {
+        model?: unknown;
+        content?: Array<{
+          type?: unknown;
+          text?: unknown;
+          id?: unknown;
+          name?: unknown;
+          input?: unknown;
+        }>;
+        usage?: { input_tokens?: unknown; output_tokens?: unknown };
+      }
+    | null;
+
+  const contentBlocks: AnthropicToolContentBlock[] = [];
+  const textParts: string[] = [];
+  const toolCalls: AnthropicToolCall[] = [];
+
+  for (const block of payload?.content ?? []) {
+    if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+      const text = block.text.trim();
+      textParts.push(text);
+      contentBlocks.push({ type: 'text', text });
+      continue;
+    }
+
+    if (
+      block?.type === 'tool_use' &&
+      typeof block.id === 'string' &&
+      typeof block.name === 'string' &&
+      block.id.trim() &&
+      block.name.trim() &&
+      block.input &&
+      typeof block.input === 'object' &&
+      !Array.isArray(block.input)
+    ) {
+      const toolCall: AnthropicToolCall = {
+        id: block.id.trim(),
+        name: block.name.trim(),
+        input: block.input as Record<string, unknown>
+      };
+      toolCalls.push(toolCall);
+      contentBlocks.push({
+        type: 'tool_use',
+        id: toolCall.id,
+        name: toolCall.name,
+        input: toolCall.input
+      });
+    }
+  }
+
+  const model = typeof payload?.model === 'string' && payload.model.trim() ? payload.model : input.model;
+  const inputTokens =
+    typeof payload?.usage?.input_tokens === 'number' && Number.isFinite(payload.usage.input_tokens)
+      ? payload.usage.input_tokens
+      : undefined;
+  const outputTokens =
+    typeof payload?.usage?.output_tokens === 'number' && Number.isFinite(payload.usage.output_tokens)
+      ? payload.usage.output_tokens
+      : undefined;
+
+  return {
+    text: textParts.join('\n').trim(),
+    model,
+    toolCalls,
+    assistantMessage: {
+      role: 'assistant',
+      content: contentBlocks.length > 0 ? contentBlocks : ''
+    },
     inputTokens,
     outputTokens
   };

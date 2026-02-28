@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import type { WorkspaceRow } from '../db';
-import { createAnthropicCompletion } from '../providers/anthropic';
+import { createAnthropicCompletion, createAnthropicToolTurn } from '../providers/anthropic';
 import { enforceCommandPolicy } from './commandPolicy';
 import { resolveAnthropicModel } from './models';
 import type { ProviderRunner } from './types';
@@ -19,6 +19,13 @@ class RequestCancelledError extends Error {
   constructor(message = 'Request cancelled by user.') {
     super(message);
     this.name = 'AbortError';
+  }
+}
+
+class NativeToolFallbackError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NativeToolFallbackError';
   }
 }
 
@@ -388,6 +395,195 @@ const executeAnthropicToolCall = async (input: {
   }
 };
 
+const stringifyToolResult = (value: unknown): string => {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+};
+
+const runAnthropicNativeTools = async (input: Parameters<ProviderRunner>[0]): Promise<{
+  text: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}> => {
+  const model = resolveAnthropicModel(input.modelProfileId, input.requestedModelId);
+  const workspacePath = input.workspace?.root_path;
+  const systemPrompt = [
+    'You are OpenVibez Anthropic coding assistant.',
+    'Use run_shell whenever shell access is needed to inspect, verify, build, or modify a workspace task.',
+    'Do not pretend commands ran if you did not actually call the tool.',
+    'When the user asks to create or edit something, make the real changes and verify them.',
+    `Access mode: ${input.accessMode}.`,
+    `Workspace trust: ${input.workspace?.trust_level ?? 'none'}.`,
+    workspacePath ? `Preferred working directory: ${workspacePath}` : 'No workspace directory is selected.'
+  ].join('\n');
+
+  const tools = [
+    {
+      name: 'run_shell',
+      description: 'Execute a shell command and return stdout, stderr, exit code, and timeout information.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'Shell command to execute.' },
+          cwd: { type: 'string', description: 'Optional working directory.' }
+        },
+        required: ['command']
+      }
+    }
+  ];
+
+  const nativeHistory: Array<{
+    role: 'user' | 'assistant';
+    content:
+      | string
+      | Array<
+          | { type: 'text'; text: string }
+          | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+          | { type: 'tool_result'; toolUseId: string; content: string; isError?: boolean }
+        >;
+  }> = [];
+
+  for (const message of input.history) {
+    if (message.role === 'system') {
+      continue;
+    }
+
+    const content = message.content.trim();
+    if (!content) {
+      continue;
+    }
+
+    nativeHistory.push({
+      role: message.role === 'assistant' ? 'assistant' : 'user',
+      content
+    });
+  }
+
+  if (nativeHistory.length === 0 || nativeHistory[0]?.role !== 'user') {
+    nativeHistory.unshift({ role: 'user', content: 'Continue.' });
+  }
+
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let sawToolCall = false;
+
+  for (let step = 0; step < MAX_ANTHROPIC_TOOL_STEPS; step += 1) {
+    throwIfAborted(input.signal);
+    input.onEvent?.({
+      type: 'status',
+      text: step === 0 ? 'Planning...' : `Executing step ${step + 1}...`
+    });
+
+    const turn = await createAnthropicToolTurn({
+      apiKey: input.secret!,
+      model,
+      system: systemPrompt,
+      messages: nativeHistory,
+      tools,
+      signal: input.signal
+    });
+
+    totalInputTokens += turn.inputTokens ?? 0;
+    totalOutputTokens += turn.outputTokens ?? 0;
+    nativeHistory.push(turn.assistantMessage);
+
+    if (turn.toolCalls.length === 0) {
+      const text = turn.text.trim();
+      if (!text && !sawToolCall) {
+        throw new NativeToolFallbackError('Anthropic native tool mode produced no text and no tool calls.');
+      }
+      if (!text) {
+        throw new Error('Anthropic returned an empty final response.');
+      }
+
+      input.onEvent?.({ type: 'assistant_delta', delta: text });
+      return {
+        text,
+        inputTokens: totalInputTokens > 0 ? totalInputTokens : undefined,
+        outputTokens: totalOutputTokens > 0 ? totalOutputTokens : undefined
+      };
+    }
+
+    sawToolCall = true;
+
+    const toolResultBlocks: Array<{ type: 'tool_result'; toolUseId: string; content: string; isError?: boolean }> = [];
+
+    for (const toolCall of turn.toolCalls) {
+      if (toolCall.name !== 'run_shell') {
+        throw new NativeToolFallbackError(`Unsupported Anthropic tool call: ${toolCall.name}`);
+      }
+
+      const command = typeof toolCall.input.command === 'string' ? toolCall.input.command.trim() : '';
+      const cwd = typeof toolCall.input.cwd === 'string' ? toolCall.input.cwd.trim() : undefined;
+      if (!command) {
+        throw new NativeToolFallbackError('Anthropic run_shell tool call is missing a command.');
+      }
+
+      input.onEvent?.({
+        type: 'trace',
+        trace: {
+          traceKind: 'action',
+          text: `Command:\n${command}\ncwd: ${cwd ?? workspacePath ?? process.cwd()}`,
+          actionKind: 'command'
+        }
+      });
+      input.onEvent?.({ type: 'status', text: 'Running command...' });
+
+      const toolResult = await executeAnthropicToolCall({
+        toolCall: {
+          name: 'run_shell',
+          arguments: { command, cwd }
+        },
+        workspacePath,
+        accessMode: input.accessMode,
+        workspace: input.workspace,
+        signal: input.signal
+      });
+
+      const traceResultLines = [
+        `exit: ${toolResult.exitCode ?? 'n/a'}${toolResult.timedOut ? ' (timeout)' : ''}`,
+        toolResult.error ? `error:\n${truncateForTrace(toolResult.error)}` : '',
+        toolResult.stdout ? `stdout:\n${truncateForTrace(toolResult.stdout)}` : '',
+        toolResult.stderr ? `stderr:\n${truncateForTrace(toolResult.stderr)}` : ''
+      ].filter((line) => line.length > 0);
+
+      input.onEvent?.({
+        type: 'trace',
+        trace: {
+          traceKind: 'action',
+          text: traceResultLines.join('\n\n'),
+          actionKind: 'command-result'
+        }
+      });
+
+      toolResultBlocks.push({
+        type: 'tool_result',
+        toolUseId: toolCall.id,
+        content: stringifyToolResult({
+          command: toolResult.command,
+          cwd: toolResult.cwd,
+          exitCode: toolResult.exitCode,
+          timedOut: toolResult.timedOut,
+          stdout: toolResult.stdout,
+          stderr: toolResult.stderr,
+          ...(toolResult.error ? { error: toolResult.error } : {})
+        }),
+        ...(toolResult.ok ? {} : { isError: true })
+      });
+    }
+
+    nativeHistory.push({
+      role: 'user',
+      content: toolResultBlocks
+    });
+  }
+
+  throw new Error(`Anthropic native tool mode reached max steps (${MAX_ANTHROPIC_TOOL_STEPS}) without finishing.`);
+};
+
 const runAnthropicCompletion = async (input: {
   apiKey: string;
   model: string;
@@ -625,6 +821,26 @@ export const runAnthropic: ProviderRunner = async (input) => {
 
   if (!input.secret) {
     throw new Error('No API key stored for this provider yet.');
+  }
+
+  try {
+    return await runAnthropicNativeTools(input);
+  } catch (error) {
+    if (error instanceof RequestCancelledError) {
+      throw error;
+    }
+
+    const message = asErrorMessage(error);
+    const likelyNativeToolMiss =
+      error instanceof NativeToolFallbackError ||
+      /tool|schema|input_schema|tool_use|tool_result|unsupported|empty final response|no text and no tool calls/i.test(
+        message
+      );
+    if (!likelyNativeToolMiss) {
+      throw error;
+    }
+
+    input.onEvent?.({ type: 'status', text: 'Falling back to Anthropic compatibility tool mode...' });
   }
 
   try {

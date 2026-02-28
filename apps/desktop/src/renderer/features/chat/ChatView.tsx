@@ -1,9 +1,17 @@
-import type { Message, MessageAccessMode, MessageStreamTrace, ModelProfile, Session, Workspace } from '../../../preload/types';
+import type { Message, MessageAccessMode, MessageStreamTrace, Session, Workspace } from '../../../preload/types';
 import type { StreamTimelineEntry } from './chat.store';
 import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Composer } from './Composer';
 import { MessageList } from './MessageList';
+
+type ChatModelOption = {
+  value: string;
+  modelId: string;
+  providerId: string;
+  providerLabel: string;
+  label: string;
+};
 
 type ChatViewProps = {
   sessions: Session[];
@@ -13,9 +21,9 @@ type ChatViewProps = {
   messages: Message[];
   onSend: (content: string) => Promise<void>;
   onCancel: () => Promise<void>;
-  modelId: string;
-  modelOptions: ModelProfile[];
-  onModelChange: (modelId: string) => Promise<void>;
+  modelValue: string;
+  modelOptions: ChatModelOption[];
+  onModelChange: (value: string) => Promise<void>;
   accessMode: MessageAccessMode;
   onAccessModeChange: (mode: MessageAccessMode) => void;
   workspaces: Workspace[];
@@ -32,7 +40,7 @@ type ChatViewProps = {
 };
 
 export const ChatView = ({
-  modelId,
+  modelValue,
   modelOptions,
   onModelChange,
   accessMode,
@@ -42,20 +50,22 @@ export const ChatView = ({
   onCancel,
   stream
 }: ChatViewProps) => {
-  const hasSelectedModel = modelOptions.some((m) => m.modelId === modelId);
+  const hasSelectedModel = modelOptions.some((m) => m.value === modelValue);
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-2 border-b border-border/40 px-4 py-2">
-        <Select value={modelId} onValueChange={(v) => void onModelChange(v)}>
-          <SelectTrigger className="h-7 w-[180px] border-0 bg-transparent text-xs text-muted-foreground hover:text-foreground">
+        <Select value={modelValue} onValueChange={(v) => void onModelChange(v)}>
+          <SelectTrigger className="h-7 w-[220px] border-0 bg-transparent text-xs text-muted-foreground hover:text-foreground">
             <SelectValue placeholder="Model" />
           </SelectTrigger>
           <SelectContent>
             {modelOptions.map((m) => (
-              <SelectItem key={m.modelId} value={m.modelId}>{m.label}</SelectItem>
+              <SelectItem key={m.value} value={m.value}>
+                {m.providerLabel} · {m.label}
+              </SelectItem>
             ))}
-            {!hasSelectedModel && <SelectItem value={modelId}>{modelId}</SelectItem>}
+            {!hasSelectedModel && <SelectItem value={modelValue}>{modelValue}</SelectItem>}
           </SelectContent>
         </Select>
 

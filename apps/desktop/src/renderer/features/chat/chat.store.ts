@@ -36,6 +36,7 @@ type ChatState = {
   sessions: Session[];
   workspaces: Workspace[];
   modelProfiles: ModelProfile[];
+  providerModelsById: Record<string, ModelProfile[]>;
   messages: Message[];
   selectedSessionId: string | null;
   selectedProviderId: string | null;
@@ -48,7 +49,7 @@ type ChatState = {
   sessionTimelineById: Record<string, StreamTimelineEntry[]>;
   streaming: StreamingState;
   initialize: () => Promise<void>;
-  createProvider: (input: { displayName: string; authKind: Provider['authKind']; type?: Provider['type'] }) => Promise<void>;
+  createProvider: (input: { displayName: string; authKind: Provider['authKind']; type?: Provider['type'] }) => Promise<Provider>;
   createSession: (title: string) => Promise<void>;
   selectSession: (sessionId: string) => Promise<void>;
   sendMessage: (content: string) => Promise<void>;
@@ -59,6 +60,7 @@ type ChatState = {
   addWorkspace: (path: string) => Promise<void>;
   setSelectedWorkspaceId: (workspaceId: string | null) => Promise<void>;
   setSelectedModelId: (modelId: string) => Promise<void>;
+  selectChatModel: (input: { providerId: string; modelId: string }) => Promise<void>;
   setAccessMode: (mode: MessageAccessMode) => void;
   openExternal: (url: string) => Promise<void>;
   startSubscriptionLogin: (providerId: string) => Promise<ProviderSubscriptionLoginState>;
@@ -123,6 +125,25 @@ const loadModelsForProvider = async (providerId: string | null): Promise<ModelPr
     return [];
   }
 };
+
+const loadModelsForProviders = async (
+  providers: Provider[]
+): Promise<Record<string, ModelProfile[]>> => {
+  const entries = await Promise.all(
+    providers.map(async (provider) => [provider.id, await loadModelsForProvider(provider.id)] as const)
+  );
+
+  return Object.fromEntries(entries);
+};
+
+const withProviderModels = (
+  current: Record<string, ModelProfile[]>,
+  providerId: string,
+  models: ModelProfile[]
+): Record<string, ModelProfile[]> => ({
+  ...current,
+  [providerId]: models
+});
 
 const appendStatus = (statuses: string[], nextStatus: string | null | undefined): string[] => {
   const normalized = nextStatus?.trim();
@@ -389,6 +410,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
   workspaces: [],
   modelProfiles: [],
+  providerModelsById: {},
   messages: [],
   selectedSessionId: null,
   selectedProviderId: null,
@@ -441,7 +463,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const providerFromSettings =
       typeof defaultProvider === 'string' && defaultProvider.trim() ? defaultProvider.trim() : null;
     const selectedProviderId = pickProviderId(nextProviders, selectedSession?.providerId ?? providerFromSettings);
-    const modelProfiles = await loadModelsForProvider(selectedProviderId);
+    const providerModelsById = await loadModelsForProviders(nextProviders);
+    const modelProfiles = selectedProviderId ? (providerModelsById[selectedProviderId] ?? []) : [];
 
     const selectedWorkspaceId = selectedSession
       ? selectedSession.workspaceId
@@ -454,6 +477,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       sessions,
       workspaces,
       modelProfiles,
+      providerModelsById,
       selectedSessionId,
       selectedProviderId,
       selectedWorkspaceId,
@@ -484,9 +508,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set((state) => ({
         selectedProviderId: provider.id,
         modelProfiles,
+        providerModelsById: withProviderModels(state.providerModelsById, provider.id, modelProfiles),
         selectedModelId: pickModelId(modelProfiles, state.selectedModelId)
       }));
     }
+
+    return provider;
   },
 
   createSession: async (title: string) => {
@@ -507,6 +534,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messages: [],
       selectedWorkspaceId: session.workspaceId,
       modelProfiles,
+      providerModelsById: withProviderModels(state.providerModelsById, session.providerId, modelProfiles),
       selectedModelId: pickModelId(modelProfiles, state.selectedModelId)
     }));
 
@@ -532,6 +560,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         [sessionId]: tracesFromTimeline(timeline)
       },
       modelProfiles,
+      providerModelsById: session?.providerId
+        ? withProviderModels(get().providerModelsById, session.providerId, modelProfiles)
+        : get().providerModelsById,
       selectedModelId: pickModelId(modelProfiles, get().selectedModelId)
     });
 
@@ -734,6 +765,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         : current.sessions,
       selectedWorkspaceId: updatedSession ? updatedSession.workspaceId : current.selectedWorkspaceId,
       modelProfiles,
+      providerModelsById: withProviderModels(current.providerModelsById, nextProviderId, modelProfiles),
       selectedModelId: pickModelId(modelProfiles, current.selectedModelId)
     }));
   },
@@ -751,7 +783,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (getActiveProviderId(state) === providerId) {
         set({
           modelProfiles: models,
+          providerModelsById: withProviderModels(state.providerModelsById, providerId, models),
           selectedModelId: pickModelId(models, state.selectedModelId)
+        });
+      } else {
+        set({
+          providerModelsById: withProviderModels(state.providerModelsById, providerId, models)
         });
       }
     }
@@ -788,6 +825,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         selectedProviderId: nextSession?.providerId ?? nextProviderId,
         messages,
         modelProfiles,
+        providerModelsById: nextProviderId
+          ? withProviderModels(state.providerModelsById, nextProviderId, modelProfiles)
+          : state.providerModelsById,
         selectedModelId: pickModelId(modelProfiles, state.selectedModelId)
       });
 
@@ -803,6 +843,49 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const nextModelId = modelId.trim() || DEFAULT_MODEL_ID;
     set({ selectedModelId: nextModelId });
     await api.settings.set({ key: 'default_model_id', value: nextModelId });
+  },
+
+  selectChatModel: async ({ providerId, modelId }) => {
+    const nextProviderId = providerId.trim();
+    const nextModelId = modelId.trim() || DEFAULT_MODEL_ID;
+    if (!nextProviderId) {
+      return;
+    }
+
+    const state = get();
+    if (!state.providers.some((provider) => provider.id === nextProviderId)) {
+      return;
+    }
+
+    let updatedSession: Session | null = null;
+    if (state.selectedSessionId) {
+      const selectedSession = state.sessions.find((session) => session.id === state.selectedSessionId) ?? null;
+      if (selectedSession && selectedSession.providerId !== nextProviderId) {
+        updatedSession = await api.session.setProvider({
+          sessionId: state.selectedSessionId,
+          providerId: nextProviderId
+        });
+      }
+    }
+
+    const modelProfiles =
+      state.providerModelsById[nextProviderId] ?? (await loadModelsForProvider(nextProviderId));
+
+    set((current) => ({
+      selectedProviderId: nextProviderId,
+      selectedModelId: nextModelId,
+      modelProfiles,
+      providerModelsById: withProviderModels(current.providerModelsById, nextProviderId, modelProfiles),
+      sessions: updatedSession
+        ? current.sessions.map((session) => (session.id === updatedSession.id ? updatedSession : session))
+        : current.sessions,
+      selectedWorkspaceId: updatedSession ? updatedSession.workspaceId : current.selectedWorkspaceId
+    }));
+
+    await Promise.all([
+      api.settings.set({ key: 'default_provider_id', value: nextProviderId }),
+      api.settings.set({ key: 'default_model_id', value: nextModelId })
+    ]);
   },
 
   setAccessMode: (mode) => {

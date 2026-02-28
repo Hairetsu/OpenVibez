@@ -5,6 +5,7 @@ import { ProviderSettings } from '../features/providers/ProviderSettings';
 import { SettingsView } from '../features/settings/SettingsView';
 import { SessionSidebar } from '../features/sidebar/SessionSidebar';
 import { TitleBar } from '@/components/TitleBar';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
 
 export const App = () => {
@@ -38,6 +39,18 @@ export const App = () => {
           status: selectedSessionStatuses[selectedSessionStatuses.length - 1] ?? null,
           statusTrail: selectedSessionStatuses
         };
+  const chatModelOptions = store.providers.flatMap((provider) =>
+    (store.providerModelsById[provider.id] ?? []).map((model) => ({
+      value: `${provider.id}::${model.modelId}`,
+      modelId: model.modelId,
+      providerId: provider.id,
+      providerLabel: provider.displayName,
+      label: model.label
+    }))
+  );
+  const selectedModelValue = store.selectedProviderId
+    ? `${store.selectedProviderId}::${store.selectedModelId}`
+    : store.selectedModelId;
 
   return (
     <div className="flex h-screen flex-col overflow-hidden">
@@ -98,9 +111,16 @@ export const App = () => {
               messages={store.messages}
               onSend={store.sendMessage}
               onCancel={store.cancelMessage}
-              modelId={store.selectedModelId}
-              modelOptions={store.modelProfiles}
-              onModelChange={store.setSelectedModelId}
+              modelValue={selectedModelValue}
+              modelOptions={chatModelOptions}
+              onModelChange={async (value) => {
+                const [providerId, ...modelParts] = value.split('::');
+                const modelId = modelParts.join('::');
+                if (!providerId || !modelId) {
+                  return;
+                }
+                await store.selectChatModel({ providerId, modelId });
+              }}
               accessMode={store.accessMode}
               onAccessModeChange={store.setAccessMode}
               workspaces={store.workspaces}
@@ -109,20 +129,49 @@ export const App = () => {
               stream={visibleStream}
             />
           ) : (
-            <div className="scroll-soft flex-1 overflow-auto p-4">
-              <div className="mx-auto grid max-w-2xl gap-4">
-                <ProviderSettings
-                  providers={store.providers}
-                  activeProviderId={store.selectedProviderId}
-                  onSelectProvider={store.setSelectedProviderId}
-                  onCreateProvider={store.createProvider}
-                  onSaveSecret={store.saveProviderSecret}
-                  onTestProvider={store.testProvider}
-                  onOpenExternal={store.openExternal}
-                  onStartSubscriptionLogin={store.startSubscriptionLogin}
-                  onGetSubscriptionLoginState={store.getSubscriptionLoginState}
-                />
-                <SettingsView usage={store.usageSummary} />
+            <div className="scroll-soft flex-1 overflow-auto">
+              <div className="mx-auto grid max-w-4xl gap-4 p-4">
+                <Tabs defaultValue="providers" className="grid gap-4">
+                  <div className="flex flex-wrap items-end justify-between gap-3 border-b border-border/50 pb-3">
+                    <div className="grid gap-1">
+                      <p className="display-font text-[11px] uppercase tracking-[0.18em] text-accent">
+                        Settings
+                      </p>
+                      <h2 className="text-lg font-semibold text-foreground">
+                        Connections and usage
+                      </h2>
+                    </div>
+                    <TabsList className="h-9 rounded-full bg-muted/40">
+                      <TabsTrigger value="providers" className="rounded-full px-4 text-xs">
+                        Providers
+                      </TabsTrigger>
+                      <TabsTrigger value="analytics" className="rounded-full px-4 text-xs">
+                        Analytics
+                      </TabsTrigger>
+                    </TabsList>
+                  </div>
+
+                  <TabsContent value="providers" className="mt-0">
+                    <ProviderSettings
+                      providers={store.providers}
+                      activeProviderId={store.selectedProviderId}
+                      modelProfiles={store.modelProfiles}
+                      selectedModelId={store.selectedModelId}
+                      onModelChange={store.setSelectedModelId}
+                      onSelectProvider={store.setSelectedProviderId}
+                      onCreateProvider={store.createProvider}
+                      onSaveSecret={store.saveProviderSecret}
+                      onTestProvider={store.testProvider}
+                      onOpenExternal={store.openExternal}
+                      onStartSubscriptionLogin={store.startSubscriptionLogin}
+                      onGetSubscriptionLoginState={store.getSubscriptionLoginState}
+                    />
+                  </TabsContent>
+
+                  <TabsContent value="analytics" className="mt-0">
+                    <SettingsView usage={store.usageSummary} />
+                  </TabsContent>
+                </Tabs>
               </div>
             </div>
           )}
