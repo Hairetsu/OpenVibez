@@ -676,7 +676,7 @@ export const createOpenAICompletion = async (input: OpenAICompletionInput): Prom
     }
   }
 
-  return runOpenAIStreaming(input);
+  return runOpenAICompatibleChatStreaming(input);
 };
 
 export const testOpenAIConnection = async (

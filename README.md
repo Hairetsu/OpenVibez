@@ -31,7 +31,7 @@ It connects directly to the providers you already use, stores secrets in your OS
 | ChatGPT subscription | Shipped | Codex device login flow, approval policy controls, optional output schema, Codex SDK pilot fallback path |
 | Anthropic | Shipped | Native provider connection plus autonomous local CLI execution flow |
 | Gemini | Shipped | Native Gemini provider path and model sync |
-| OpenRouter | Shipped | Native OpenRouter provider path, provider headers, pricing sync, cost attribution |
+| OpenRouter | Shipped | Native OpenRouter provider path, provider headers, pricing sync, cost attribution, autonomous local CLI execution with direct-response fallback |
 | Grok (xAI) | Shipped | Native Grok provider path with direct xAI API support and autonomous local CLI execution |
 | Ollama | Shipped | Local models, diagnostics, runtime controls, native tool-calling path with protocol fallback |
 

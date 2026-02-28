@@ -391,7 +391,6 @@ const ensureStreamListener = (
           },
           streaming: {
             ...current.streaming,
-            active: false,
             status: nextStatus,
             statusTrail: nextStatuses
           }
