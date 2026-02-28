@@ -9,7 +9,7 @@ It connects directly to the providers you already use, stores secrets in your OS
 
 > **Status:** Early alpha.
 >
-> OpenVibez can execute local shell commands and supports elevated/root-style execution modes. Treat it like powerful experimental software, not a sandboxed product.
+> Listen bub: this is sketchy, experimental, vibey software. It can run local shell commands, supports elevated/root-style execution modes, and absolutely should not be treated like a polite little sandboxed toy. If you point it at something important, do that with your eyes open.
 
 ## What It Does Today
 
@@ -22,6 +22,8 @@ It connects directly to the providers you already use, stores secrets in your OS
 - Per-provider model sync and selection
 - Markdown rendering with syntax highlighting in chat messages
 - 30-day token and cost summary in Settings
+
+In plain English: it talks straight to model providers, keeps most of its mess on your machine, and is trying very hard to be useful before it is respectable.
 
 ## Provider Support
 
@@ -106,6 +108,8 @@ npm run db:studio
 4. Run **Save + Test** or **Check** to sync models.
 5. Start a session and pick a model/access mode.
 
+If everything boots first try, act normal. Nobody likes a showoff.
+
 ### Environment variables
 
 | Variable | Description |
@@ -152,3 +156,5 @@ npm run db:studio
 ## License
 
 MIT
+
+Ya I also vibed the README.
